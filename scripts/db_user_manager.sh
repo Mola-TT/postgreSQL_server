@@ -1,348 +1,188 @@
 #!/bin/bash
-# Database User Management Script
-# Creates and manages PostgreSQL users with proper security restrictions
+# Database User Manager Script
+# This script creates restricted PostgreSQL users with access to specific databases
 
 # Log file
-LOG_FILE="/var/log/db-user-manager.log"
-PG_VERSION=$(ls /etc/postgresql/ | sort -V | tail -n1)
+LOG_FILE="/var/log/dbhub/db_user_manager.log"
 
-# Load environment variables
-ENV_FILES=("/etc/dbhub/.env" "/opt/dbhub/.env" "$(dirname "$0")/../.env" ".env")
-for ENV_FILE in "${ENV_FILES[@]}"; do
-    if [[ -f "$ENV_FILE" ]]; then
-        source "$ENV_FILE"
-        break
-    fi
-done
+# Ensure log directory exists
+mkdir -p $(dirname $LOG_FILE)
+touch $LOG_FILE
 
 # Logging function
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
 }
 
-# Create log file if it doesn't exist
-if [[ ! -f "$LOG_FILE" ]]; then
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
-    chmod 640 "$LOG_FILE"
-fi
-
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    log "ERROR: This script must be run as root"
-    exit 1
-fi
-
-# Check if PostgreSQL is installed
-if ! command -v psql &> /dev/null; then
-    log "ERROR: PostgreSQL is not installed"
-    exit 1
-fi
-
-# Check if PostgreSQL is running
-if ! systemctl is-active --quiet postgresql; then
-    log "ERROR: PostgreSQL service is not running"
-    exit 1
-fi
-
-# Create a database with a restricted user
-create_user_db() {
-    DB_NAME="$1"
-    USER_NAME="$2"
-    PASSWORD="$3"
+# Function to check if a database exists
+database_exists() {
+    local db_name="$1"
+    local exists=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'")
     
-    # Validate inputs
-    if [[ -z "$DB_NAME" || -z "$USER_NAME" || -z "$PASSWORD" ]]; then
-        log "ERROR: Database name, username, and password are required"
-        exit 1
-    fi
-    
-    # Check if database already exists
-    if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
-        log "WARNING: Database '$DB_NAME' already exists"
+    if [ "$exists" = "1" ]; then
+        return 0  # Database exists
     else
-        log "Creating database '$DB_NAME'"
-        sudo -u postgres psql -c "CREATE DATABASE $DB_NAME;" || {
-            log "ERROR: Failed to create database '$DB_NAME'"
-            exit 1
-        }
+        return 1  # Database does not exist
+    fi
+}
+
+# Function to check if a user exists
+user_exists() {
+    local user_name="$1"
+    local exists=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'")
+    
+    if [ "$exists" = "1" ]; then
+        return 0  # User exists
+    else
+        return 1  # User does not exist
+    fi
+}
+
+# Function to create a restricted user with access to a specific database
+create_restricted_user() {
+    local db_name="$1"
+    local user_name="$2"
+    local password="$3"
+    
+    # Check if database exists
+    if ! database_exists "$db_name"; then
+        log "Error: Database '$db_name' does not exist"
+        return 1
     fi
     
     # Check if user already exists
-    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER_NAME'" | grep -q 1; then
-        log "WARNING: User '$USER_NAME' already exists"
+    if user_exists "$user_name"; then
+        log "User '$user_name' already exists. Updating password and permissions."
+        
+        # Update user password
+        sudo -u postgres psql -c "ALTER USER \"$user_name\" WITH PASSWORD '$password'"
+        log "Updated password for user '$user_name'"
     else
-        log "Creating user '$USER_NAME'"
-        sudo -u postgres psql -c "CREATE USER $USER_NAME WITH ENCRYPTED PASSWORD '$PASSWORD';" || {
-            log "ERROR: Failed to create user '$USER_NAME'"
-            exit 1
-        }
+        # Create new user with password
+        sudo -u postgres psql -c "CREATE USER \"$user_name\" WITH PASSWORD '$password'"
+        log "Created new user '$user_name'"
     fi
     
-    # Grant privileges
-    log "Granting privileges on '$DB_NAME' to '$USER_NAME'"
-    sudo -u postgres psql -c "GRANT CONNECT ON DATABASE $DB_NAME TO $USER_NAME;" || {
-        log "ERROR: Failed to grant CONNECT privilege"
-        exit 1
-    }
+    # Revoke all privileges from public schema
+    sudo -u postgres psql -c "REVOKE ALL ON DATABASE \"$db_name\" FROM \"$user_name\""
+    
+    # Grant connect privilege to the database
+    sudo -u postgres psql -c "GRANT CONNECT ON DATABASE \"$db_name\" TO \"$user_name\""
+    log "Granted CONNECT privilege on database '$db_name' to user '$user_name'"
     
     # Connect to the database and set up schema permissions
-    sudo -u postgres psql -d "$DB_NAME" -c "
-        -- Revoke public schema usage from PUBLIC
-        REVOKE ALL ON SCHEMA public FROM PUBLIC;
-        
-        -- Grant usage on public schema to the specific user
-        GRANT USAGE ON SCHEMA public TO $USER_NAME;
-        
-        -- Grant privileges on all tables in public schema to the user
-        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO $USER_NAME;
-        
-        -- Grant privileges on all sequences in public schema to the user
-        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO $USER_NAME;
-        
-        -- Set default privileges for future tables
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO $USER_NAME;
-        
-        -- Set default privileges for future sequences
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO $USER_NAME;
-    " || {
-        log "ERROR: Failed to set up schema permissions"
-        exit 1
-    }
+    sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM \"$user_name\""
+    sudo -u postgres psql -d "$db_name" -c "GRANT USAGE ON SCHEMA public TO \"$user_name\""
+    log "Granted USAGE privilege on schema 'public' to user '$user_name'"
     
-    log "Successfully created database '$DB_NAME' with restricted user '$USER_NAME'"
+    # Grant privileges on all tables in the public schema
+    sudo -u postgres psql -d "$db_name" -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"$user_name\""
+    log "Granted SELECT, INSERT, UPDATE, DELETE privileges on all tables to user '$user_name'"
+    
+    # Grant privileges on all sequences in the public schema
+    sudo -u postgres psql -d "$db_name" -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"$user_name\""
+    log "Granted USAGE, SELECT privileges on all sequences to user '$user_name'"
+    
+    # Set default privileges for future tables
+    sudo -u postgres psql -d "$db_name" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$user_name\""
+    sudo -u postgres psql -d "$db_name" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO \"$user_name\""
+    log "Set default privileges for future tables and sequences for user '$user_name'"
+    
+    log "Successfully configured restricted user '$user_name' for database '$db_name'"
+    return 0
 }
 
-# List all databases and their owners
+# Function to list all databases
 list_databases() {
-    log "Listing all databases and their owners"
-    
-    sudo -u postgres psql -c "
-        SELECT d.datname as database, 
-               pg_catalog.pg_get_userbyid(d.datdba) as owner,
-               pg_size_pretty(pg_database_size(d.datname)) as size
-        FROM pg_catalog.pg_database d
-        WHERE d.datistemplate = false
-        ORDER BY d.datname;
-    "
+    log "Listing all databases"
+    sudo -u postgres psql -c "\l"
 }
 
-# List all users and their permissions
+# Function to list all users
 list_users() {
-    log "Listing all users and their permissions"
-    
-    sudo -u postgres psql -c "
-        SELECT r.rolname as username,
-               r.rolsuper as is_superuser,
-               r.rolinherit as inherits_privileges,
-               r.rolcreaterole as can_create_roles,
-               r.rolcreatedb as can_create_dbs,
-               r.rolcanlogin as can_login,
-               r.rolreplication as has_replication,
-               r.rolconnlimit as connection_limit,
-               r.rolvaliduntil as valid_until
-        FROM pg_catalog.pg_roles r
-        ORDER BY r.rolname;
-    "
+    log "Listing all users"
+    sudo -u postgres psql -c "\du"
 }
 
-# Delete a user and optionally their database
+# Function to delete a user
 delete_user() {
-    USER_NAME="$1"
-    DELETE_DB="$2"
+    local user_name="$1"
     
-    # Validate inputs
-    if [[ -z "$USER_NAME" ]]; then
-        log "ERROR: Username is required"
-        exit 1
+    if user_exists "$user_name"; then
+        sudo -u postgres psql -c "DROP USER \"$user_name\""
+        log "Deleted user '$user_name'"
+        return 0
+    else
+        log "Error: User '$user_name' does not exist"
+        return 1
     fi
-    
-    # Check if user exists
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER_NAME'" | grep -q 1; then
-        log "ERROR: User '$USER_NAME' does not exist"
-        exit 1
-    fi
-    
-    # Get databases owned by the user
-    OWNED_DBS=$(sudo -u postgres psql -tAc "
-        SELECT d.datname 
-        FROM pg_catalog.pg_database d 
-        JOIN pg_catalog.pg_roles r ON d.datdba = r.oid 
-        WHERE r.rolname = '$USER_NAME'
-    ")
-    
-    # If DELETE_DB is true, drop owned databases
-    if [[ "$DELETE_DB" == "true" ]]; then
-        for DB in $OWNED_DBS; do
-            log "Dropping database '$DB' owned by '$USER_NAME'"
-            sudo -u postgres psql -c "DROP DATABASE $DB;" || {
-                log "ERROR: Failed to drop database '$DB'"
-            }
-        done
-    elif [[ -n "$OWNED_DBS" ]]; then
-        log "WARNING: User '$USER_NAME' owns databases. Reassigning ownership to postgres"
-        for DB in $OWNED_DBS; do
-            log "Reassigning ownership of database '$DB' to postgres"
-            sudo -u postgres psql -c "ALTER DATABASE $DB OWNER TO postgres;" || {
-                log "ERROR: Failed to reassign ownership of database '$DB'"
-            }
-        done
-    fi
-    
-    # Revoke all privileges from the user
-    log "Revoking all privileges from user '$USER_NAME'"
-    sudo -u postgres psql -c "REASSIGN OWNED BY $USER_NAME TO postgres;" || {
-        log "WARNING: Failed to reassign objects owned by '$USER_NAME'"
-    }
-    
-    sudo -u postgres psql -c "DROP OWNED BY $USER_NAME;" || {
-        log "WARNING: Failed to drop objects owned by '$USER_NAME'"
-    }
-    
-    # Drop the user
-    log "Dropping user '$USER_NAME'"
-    sudo -u postgres psql -c "DROP USER $USER_NAME;" || {
-        log "ERROR: Failed to drop user '$USER_NAME'"
-        exit 1
-    }
-    
-    log "Successfully deleted user '$USER_NAME'"
 }
 
-# Change user password
-change_password() {
-    USER_NAME="$1"
-    NEW_PASSWORD="$2"
+# Function to create a new database
+create_database() {
+    local db_name="$1"
+    local owner="$2"
     
-    # Validate inputs
-    if [[ -z "$USER_NAME" || -z "$NEW_PASSWORD" ]]; then
-        log "ERROR: Username and new password are required"
-        exit 1
+    # If no owner specified, use postgres
+    if [ -z "$owner" ]; then
+        owner="postgres"
     fi
     
-    # Check if user exists
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER_NAME'" | grep -q 1; then
-        log "ERROR: User '$USER_NAME' does not exist"
-        exit 1
+    # Check if database already exists
+    if database_exists "$db_name"; then
+        log "Error: Database '$db_name' already exists"
+        return 1
     fi
     
-    # Change password
-    log "Changing password for user '$USER_NAME'"
-    sudo -u postgres psql -c "ALTER USER $USER_NAME WITH ENCRYPTED PASSWORD '$NEW_PASSWORD';" || {
-        log "ERROR: Failed to change password for user '$USER_NAME'"
-        exit 1
-    }
-    
-    log "Successfully changed password for user '$USER_NAME'"
-}
-
-# Grant additional privileges to a user
-grant_privileges() {
-    USER_NAME="$1"
-    DB_NAME="$2"
-    PRIVILEGES="$3"
-    
-    # Validate inputs
-    if [[ -z "$USER_NAME" || -z "$DB_NAME" || -z "$PRIVILEGES" ]]; then
-        log "ERROR: Username, database name, and privileges are required"
-        exit 1
+    # Check if owner exists
+    if ! user_exists "$owner"; then
+        log "Error: Owner '$owner' does not exist"
+        return 1
     fi
     
-    # Check if user exists
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER_NAME'" | grep -q 1; then
-        log "ERROR: User '$USER_NAME' does not exist"
-        exit 1
-    fi
-    
-    # Check if database exists
-    if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
-        log "ERROR: Database '$DB_NAME' does not exist"
-        exit 1
-    fi
-    
-    # Grant privileges
-    log "Granting $PRIVILEGES privileges on '$DB_NAME' to '$USER_NAME'"
-    
-    case "$PRIVILEGES" in
-        "read")
-            sudo -u postgres psql -d "$DB_NAME" -c "
-                GRANT CONNECT ON DATABASE $DB_NAME TO $USER_NAME;
-                GRANT USAGE ON SCHEMA public TO $USER_NAME;
-                GRANT SELECT ON ALL TABLES IN SCHEMA public TO $USER_NAME;
-                GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO $USER_NAME;
-            " || {
-                log "ERROR: Failed to grant read privileges"
-                exit 1
-            }
-            ;;
-        "write")
-            sudo -u postgres psql -d "$DB_NAME" -c "
-                GRANT CONNECT ON DATABASE $DB_NAME TO $USER_NAME;
-                GRANT USAGE ON SCHEMA public TO $USER_NAME;
-                GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO $USER_NAME;
-                GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO $USER_NAME;
-            " || {
-                log "ERROR: Failed to grant write privileges"
-                exit 1
-            }
-            ;;
-        "all")
-            sudo -u postgres psql -d "$DB_NAME" -c "
-                GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $USER_NAME;
-                GRANT ALL PRIVILEGES ON SCHEMA public TO $USER_NAME;
-                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $USER_NAME;
-                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $USER_NAME;
-                GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO $USER_NAME;
-                ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON FUNCTIONS TO $USER_NAME;
-            " || {
-                log "ERROR: Failed to grant all privileges"
-                exit 1
-            }
-            ;;
-        *)
-            log "ERROR: Invalid privileges. Use 'read', 'write', or 'all'"
-            exit 1
-            ;;
-    esac
-    
-    log "Successfully granted $PRIVILEGES privileges on '$DB_NAME' to '$USER_NAME'"
+    # Create the database
+    sudo -u postgres psql -c "CREATE DATABASE \"$db_name\" OWNER \"$owner\""
+    log "Created database '$db_name' with owner '$owner'"
+    return 0
 }
 
 # Display usage information
 usage() {
-    echo "Usage: $0 COMMAND [OPTIONS]"
-    echo
-    echo "Commands:"
-    echo "  create-user DB_NAME USER_NAME PASSWORD   Create a database with a restricted user"
-    echo "  list-dbs                                 List all databases and their owners"
-    echo "  list-users                               List all users and their permissions"
-    echo "  delete-user USER_NAME [true|false]       Delete a user (optionally delete owned databases)"
-    echo "  change-password USER_NAME NEW_PASSWORD   Change a user's password"
-    echo "  grant-privileges USER_NAME DB_NAME TYPE  Grant privileges (read, write, all) to a user"
-    echo "  help                                     Display this help message"
-    echo
-    echo "Examples:"
-    echo "  $0 create-user mydb myuser mypassword    Create 'mydb' with restricted user 'myuser'"
-    echo "  $0 list-dbs                              List all databases"
-    echo "  $0 delete-user myuser true               Delete user 'myuser' and their databases"
-    echo "  $0 grant-privileges myuser mydb write    Grant write privileges to 'myuser' on 'mydb'"
+    echo "Database User Manager"
+    echo "Usage:"
+    echo "  $0 create-user <db_name> <user_name> <password>  - Create a user with access only to a specific database"
+    echo "  $0 create-db <db_name> [owner]                   - Create a new database with optional owner"
+    echo "  $0 delete-user <user_name>                       - Delete a user"
+    echo "  $0 list-dbs                                      - List all databases"
+    echo "  $0 list-users                                    - List all users"
+    echo "  $0 help                                          - Display this help message"
 }
 
 # Main script logic
 case "$1" in
     create-user)
-        if [[ $# -ne 4 ]]; then
-            log "ERROR: create-user requires database name, username, and password"
+        if [ $# -ne 4 ]; then
+            echo "Error: Missing arguments for create-user"
             usage
             exit 1
         fi
-        create_user_db "$2" "$3" "$4"
+        create_restricted_user "$2" "$3" "$4"
+        ;;
+    create-db)
+        if [ $# -lt 2 ]; then
+            echo "Error: Missing arguments for create-db"
+            usage
+            exit 1
+        fi
+        create_database "$2" "$3"
+        ;;
+    delete-user)
+        if [ $# -ne 2 ]; then
+            echo "Error: Missing argument for delete-user"
+            usage
+            exit 1
+        fi
+        delete_user "$2"
         ;;
     list-dbs)
         list_databases
@@ -350,35 +190,11 @@ case "$1" in
     list-users)
         list_users
         ;;
-    delete-user)
-        if [[ $# -lt 2 ]]; then
-            log "ERROR: delete-user requires a username"
-            usage
-            exit 1
-        fi
-        delete_user "$2" "${3:-false}"
-        ;;
-    change-password)
-        if [[ $# -ne 3 ]]; then
-            log "ERROR: change-password requires username and new password"
-            usage
-            exit 1
-        fi
-        change_password "$2" "$3"
-        ;;
-    grant-privileges)
-        if [[ $# -ne 4 ]]; then
-            log "ERROR: grant-privileges requires username, database name, and privilege type"
-            usage
-            exit 1
-        fi
-        grant_privileges "$2" "$3" "$4"
-        ;;
     help|--help|-h)
         usage
         ;;
     *)
-        echo "Unknown command: $1"
+        echo "Error: Unknown command '$1'"
         usage
         exit 1
         ;;

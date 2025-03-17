@@ -1,82 +1,200 @@
-# DBHub.cc - PostgreSQL Server Management Suite
+# DBHub.cc - PostgreSQL Server Management Scripts
 
-A comprehensive suite of scripts for setting up, managing, and monitoring PostgreSQL servers with advanced features like connection pooling, automatic subdomain routing, and security hardening.
+A collection of scripts for setting up and managing PostgreSQL servers with PgBouncer for connection pooling, enhanced security, and monitoring capabilities.
 
-## Features
+## Overview
 
-- **One-command PostgreSQL setup** with PgBouncer connection pooling
-- **Automatic subdomain routing** for databases using Nginx
-- **Secure by default** with restricted users, SSL, and proper permissions
-- **Comprehensive monitoring** with email alerts and performance tracking
-- **Auto-scaling** PostgreSQL based on server resources
-- **Modular design** for easy customization and extension
+This project provides a comprehensive set of scripts for:
 
-## Quick Installation
+- Installing and configuring PostgreSQL and PgBouncer
+- Managing database users with proper security restrictions
+- Backing up and restoring PostgreSQL databases
+- Monitoring server resources and PostgreSQL performance
+- Updating PgBouncer user lists from PostgreSQL
 
-```bash
-git clone https://github.com/Mola-TT/postgreSQL_server.git
-cd postgreSQL_server
-cp .env.example .env
-# Edit .env with your settings
+## Scripts
 
-# Make scripts executable
-chmod +x server_init.sh
-chmod +x scripts/*.sh
-chmod +x modules/*.sh
+### Main Scripts
 
-# Run the main installation script
-sudo ./server_init.sh
-```
-
-## Documentation
-
-For detailed usage instructions, see the [Usage Guide](USAGE_GUIDE.md).
-
-## Components
-
-- **server_init.sh**: Main installation script
-- **modules/**: Modular components for different features
-  - **postgresql.sh**: PostgreSQL installation and configuration
-  - **pgbouncer.sh**: PgBouncer setup and management
-  - **security.sh**: Security hardening features
-  - **monitoring.sh**: Server monitoring setup
-  - **subdomain.sh**: Subdomain routing configuration
-- **scripts/**: Utility scripts
-  - **db_user_manager.sh**: Database and user management
-  - **create_db_subdomain.sh**: Subdomain creation for databases
-  - **server_monitor.sh**: Server resource monitoring
-  - **pg_auto_scale.sh**: PostgreSQL auto-scaling
+- `server_init.sh` - Main server initialization script that installs and configures PostgreSQL and PgBouncer
+- `scripts/server_monitor.sh` - Monitors system resources and PostgreSQL/PgBouncer services
+- `scripts/backup_postgres.sh` - Creates backups of PostgreSQL databases with rotation
+- `scripts/restore_postgres.sh` - Restores PostgreSQL databases from backups
+- `scripts/db_user_manager.sh` - Creates and manages restricted PostgreSQL users
+- `scripts/update_pgbouncer_users.sh` - Updates PgBouncer user list from PostgreSQL
 
 ## Requirements
 
-- Ubuntu 20.04+ or Debian 11+
-- Sudo access
+- Ubuntu Server (tested on 20.04 LTS and 22.04 LTS)
+- Root or sudo access
 - Internet connection for package installation
+
+## Installation
+
+1. Clone this repository:
+   ```
+   git clone https://github.com/yourusername/dbhub.cc.git
+   cd dbhub.cc
+   ```
+
+2. Make the scripts executable:
+   ```
+   chmod +x server_init.sh
+   chmod +x scripts/*.sh
+   ```
+
+3. Run the server initialization script:
+   ```
+   sudo ./server_init.sh install
+   ```
+
+## Configuration
+
+The server initialization script creates a configuration file at `/etc/dbhub/.env` with default settings. You can modify this file to customize your installation.
+
+Key configuration options:
+
+- `PG_VERSION` - PostgreSQL version to install
+- `ENABLE_REMOTE_ACCESS` - Whether to allow remote connections to PostgreSQL
+- `EMAIL_*` - Email settings for alerts
+- `DOMAIN_SUFFIX` - Domain suffix for server
+
+## Usage
+
+### Managing Database Users
+
+Create a restricted user with access to a specific database:
+
+```
+sudo ./scripts/db_user_manager.sh create-user mydb myuser mypassword
+```
+
+List all databases:
+
+```
+sudo ./scripts/db_user_manager.sh list-dbs
+```
+
+List all users:
+
+```
+sudo ./scripts/db_user_manager.sh list-users
+```
+
+Create a new database:
+
+```
+sudo ./scripts/db_user_manager.sh create-db mydb [owner]
+```
+
+Delete a user:
+
+```
+sudo ./scripts/db_user_manager.sh delete-user myuser
+```
+
+### Backing Up Databases
+
+The backup script is automatically scheduled to run daily at 2 AM. You can also run it manually:
+
+```
+sudo ./scripts/backup_postgres.sh
+```
+
+Backups are stored in `/var/backups/postgresql` with a timestamp directory for each backup run.
+
+### Restoring Databases
+
+List available backups:
+
+```
+sudo ./scripts/restore_postgres.sh list-backups
+```
+
+List databases in a backup:
+
+```
+sudo ./scripts/restore_postgres.sh list-databases latest
+```
+
+Restore a database:
+
+```
+sudo ./scripts/restore_postgres.sh restore-db latest mydb
+```
+
+Restore a database to a new name:
+
+```
+sudo ./scripts/restore_postgres.sh restore-db latest mydb mydb_restored
+```
+
+Restore global objects (roles, tablespaces):
+
+```
+sudo ./scripts/restore_postgres.sh restore-globals latest
+```
+
+### Monitoring
+
+The server monitoring script is automatically scheduled to run every 15 minutes. You can also run it manually:
+
+```
+sudo ./scripts/server_monitor.sh
+```
+
+The script checks:
+- CPU, memory, and disk usage
+- PostgreSQL and PgBouncer service status
+- PostgreSQL connection count
+- Database sizes
+- Slow queries
+- Database locks
+- Failed login attempts
+
+Alerts are sent via email if thresholds are exceeded.
+
+### Updating PgBouncer Users
+
+The PgBouncer user update script is automatically scheduled to run daily at 3 AM. You can also run it manually:
+
+```
+sudo ./scripts/update_pgbouncer_users.sh
+```
 
 ## Security Features
 
 - Restricted database users with minimal privileges
-- SSL/TLS for all connections
-- Automatic security updates
+- Firewall configuration with UFW
+- fail2ban integration for brute force protection
+- Secure password storage
 - Proper file permissions
-- Comprehensive logging
-- Email alerts for suspicious activities
 
-## Contributing
+## Logs
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+All scripts log their activities to files in `/var/log/dbhub/`:
+
+- `server_init.log` - Server initialization log
+- `server_monitor.log` - Monitoring log
+- `backup.log` - Backup log
+- `restore.log` - Restore log
+- `db_user_manager.log` - User management log
+- `pgbouncer_update.log` - PgBouncer user update log
+
+## Troubleshooting
+
+If you encounter issues:
+
+1. Check the log files in `/var/log/dbhub/`
+2. Verify PostgreSQL is running: `systemctl status postgresql`
+3. Verify PgBouncer is running: `systemctl status pgbouncer`
+4. Check PostgreSQL logs: `tail -f /var/log/postgresql/postgresql-*-main.log`
+5. Check PgBouncer logs: `tail -f /var/log/postgresql/pgbouncer.log`
 
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Acknowledgments
+## Contributing
 
-- PostgreSQL community
-- PgBouncer developers
-- Nginx team
-- All open-source contributors who made this possible
-
-## Repository
-
-GitHub: [@https://github.com/Mola-TT/postgreSQL_server.git](https://github.com/Mola-TT/postgreSQL_server.git)
+Contributions are welcome! Please feel free to submit a Pull Request.
