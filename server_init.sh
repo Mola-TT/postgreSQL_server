@@ -62,6 +62,93 @@ package_installed() {
     dpkg -l "$1" | grep -q "^ii" >/dev/null 2>&1
 }
 
+# Function to check PostgreSQL logs for errors
+check_postgresql_logs() {
+    log "Checking PostgreSQL logs for errors"
+    
+    # Find the most recent PostgreSQL log file
+    local log_files=$(find /var/log/postgresql -name "postgresql-*.log" -type f 2>/dev/null | sort -r)
+    
+    if [ -z "$log_files" ]; then
+        log "No PostgreSQL log files found in /var/log/postgresql"
+        
+        # Check alternative locations
+        log_files=$(find /var/lib/postgresql/$PG_VERSION/main/log -name "postgresql-*.log" -type f 2>/dev/null | sort -r)
+        
+        if [ -z "$log_files" ]; then
+            log "No PostgreSQL log files found in alternative locations"
+            return 1
+        fi
+    fi
+    
+    # Get the most recent log file
+    local recent_log=$(echo "$log_files" | head -n 1)
+    log "Most recent PostgreSQL log file: $recent_log"
+    
+    # Check for common error patterns
+    if grep -q "could not bind IPv4 socket" "$recent_log"; then
+        log "ERROR: PostgreSQL cannot bind to its port. Another process may be using port 5432."
+        log "Checking for processes using port 5432..."
+        if command_exists lsof; then
+            lsof -i :5432 || log "No process found using port 5432 with lsof"
+        fi
+        if command_exists netstat; then
+            netstat -tuln | grep 5432 || log "No process found using port 5432 with netstat"
+        fi
+    elif grep -q "could not access directory" "$recent_log"; then
+        log "ERROR: PostgreSQL cannot access its data directory. Checking permissions..."
+        ls -la /var/lib/postgresql/$PG_VERSION/main/
+    elif grep -q "database system is shut down" "$recent_log"; then
+        log "ERROR: PostgreSQL database system is shut down. Trying to initialize..."
+        sudo -u postgres pg_ctl -D /var/lib/postgresql/$PG_VERSION/main init
+    fi
+    
+    # Display the last 20 lines of the log
+    log "Last 20 lines of PostgreSQL log:"
+    tail -n 20 "$recent_log" | while read line; do
+        log "  $line"
+    done
+}
+
+# Function to fix common PostgreSQL startup issues
+fix_postgresql_startup() {
+    log "Attempting to fix PostgreSQL startup issues"
+    
+    # Check if data directory exists
+    if [ ! -d "/var/lib/postgresql/$PG_VERSION/main" ]; then
+        log "PostgreSQL data directory does not exist. Creating it..."
+        mkdir -p "/var/lib/postgresql/$PG_VERSION/main"
+        chown postgres:postgres "/var/lib/postgresql/$PG_VERSION/main"
+    fi
+    
+    # Check permissions on data directory
+    log "Checking permissions on PostgreSQL data directory"
+    if [ "$(stat -c '%U:%G' /var/lib/postgresql/$PG_VERSION/main)" != "postgres:postgres" ]; then
+        log "Fixing permissions on PostgreSQL data directory"
+        chown -R postgres:postgres "/var/lib/postgresql/$PG_VERSION/main"
+    fi
+    
+    # Check if PostgreSQL is initialized
+    if [ ! -f "/var/lib/postgresql/$PG_VERSION/main/PG_VERSION" ]; then
+        log "PostgreSQL data directory is not initialized. Initializing..."
+        sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/initdb -D "/var/lib/postgresql/$PG_VERSION/main"
+    fi
+    
+    # Try to start PostgreSQL manually
+    log "Attempting to start PostgreSQL manually"
+    sudo -u postgres pg_ctl -D "/var/lib/postgresql/$PG_VERSION/main" -l "/var/log/postgresql/postgresql-$PG_VERSION-manual.log" start
+    
+    # Wait a bit and check if it's running
+    sleep 10
+    if sudo -u postgres pg_isready -q; then
+        log "PostgreSQL started successfully with manual start"
+        return 0
+    else
+        log "PostgreSQL still not running after manual start"
+        return 1
+    fi
+}
+
 # Function to wait for PostgreSQL to be ready
 wait_for_postgresql() {
     local max_attempts=30
@@ -81,7 +168,19 @@ wait_for_postgresql() {
     done
     
     log "ERROR: PostgreSQL did not become ready after $max_attempts attempts"
-    return 1
+    
+    # Check logs and try to fix issues
+    check_postgresql_logs
+    
+    # Try to fix startup issues
+    if fix_postgresql_startup; then
+        log "Successfully fixed PostgreSQL startup issues"
+        return 0
+    else
+        log "Failed to fix PostgreSQL startup issues"
+        log "Please check the PostgreSQL logs and configuration manually"
+        return 1
+    fi
 }
 
 # Function to create or load environment file
@@ -193,6 +292,7 @@ configure_postgres() {
     if [ ! -d "/etc/postgresql/$PG_VERSION/main" ]; then
         log "PostgreSQL configuration directory does not exist. Creating it."
         mkdir -p "/etc/postgresql/$PG_VERSION/main"
+        chown postgres:postgres "/etc/postgresql/$PG_VERSION/main"
     fi
     
     # Check if PostgreSQL is installed properly
@@ -263,6 +363,7 @@ search_path = '"$user", public'
 default_tablespace = ''
 temp_tablespaces = ''
 EOF
+        chown postgres:postgres "/etc/postgresql/$PG_VERSION/main/postgresql.conf"
     fi
     
     # Configure PostgreSQL to listen on appropriate interfaces
@@ -286,6 +387,7 @@ host    all             all             127.0.0.1/32            md5
 # IPv6 local connections:
 host    all             all             ::1/128                 md5
 EOF
+    chown postgres:postgres "/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
     
     # Add remote access if enabled
     if [ "$ENABLE_REMOTE_ACCESS" = true ]; then
@@ -295,10 +397,16 @@ EOF
     
     # Restart PostgreSQL to apply configuration changes
     log "Restarting PostgreSQL to apply configuration changes"
-    systemctl restart postgresql
+    systemctl restart postgresql || {
+        log "Failed to restart PostgreSQL with systemctl. Trying to start manually."
+        sudo -u postgres pg_ctl -D "/var/lib/postgresql/$PG_VERSION/main" -l "/var/log/postgresql/postgresql-$PG_VERSION-manual.log" start
+    }
     
     # Wait for PostgreSQL to be ready
-    wait_for_postgresql
+    if ! wait_for_postgresql; then
+        log "ERROR: PostgreSQL failed to start. Exiting."
+        exit 1
+    fi
     
     # Set PostgreSQL password
     log "Setting PostgreSQL password"
@@ -503,6 +611,56 @@ setup_monitoring() {
     log "Monitoring setup complete"
 }
 
+# Function to run diagnostics
+run_diagnostics() {
+    log "Running PostgreSQL diagnostics"
+    
+    # Check if PostgreSQL is installed
+    if command_exists psql; then
+        log "PostgreSQL client is installed: $(psql --version)"
+    else
+        log "ERROR: PostgreSQL client is not installed"
+    fi
+    
+    # Check PostgreSQL service status
+    log "PostgreSQL service status:"
+    systemctl status postgresql || log "Failed to get PostgreSQL service status"
+    
+    # Check PostgreSQL cluster status
+    log "PostgreSQL cluster status:"
+    pg_lsclusters || log "Failed to list PostgreSQL clusters"
+    
+    # Check PostgreSQL data directory
+    log "PostgreSQL data directory:"
+    ls -la /var/lib/postgresql/$PG_VERSION/main/ || log "Failed to list PostgreSQL data directory"
+    
+    # Check PostgreSQL configuration directory
+    log "PostgreSQL configuration directory:"
+    ls -la /etc/postgresql/$PG_VERSION/main/ || log "Failed to list PostgreSQL configuration directory"
+    
+    # Check PostgreSQL log directory
+    log "PostgreSQL log directory:"
+    ls -la /var/log/postgresql/ || log "Failed to list PostgreSQL log directory"
+    
+    # Check PostgreSQL port
+    log "Checking if PostgreSQL port is in use:"
+    if command_exists lsof; then
+        lsof -i :5432 || log "No process found using port 5432 with lsof"
+    fi
+    if command_exists netstat; then
+        netstat -tuln | grep 5432 || log "No process found using port 5432 with netstat"
+    fi
+    
+    # Check if PostgreSQL is accepting connections
+    log "Checking if PostgreSQL is accepting connections:"
+    sudo -u postgres pg_isready -v || log "PostgreSQL is not accepting connections"
+    
+    # Check PostgreSQL logs
+    check_postgresql_logs
+    
+    log "Diagnostics complete"
+}
+
 # Main function
 main() {
     log "Starting server initialization"
@@ -517,10 +675,20 @@ main() {
     install_postgres
     
     # Configure PostgreSQL
-    configure_postgres
+    configure_postgres || {
+        log "ERROR: Failed to configure PostgreSQL. Running diagnostics..."
+        run_diagnostics
+        log "Please fix the issues and try again."
+        exit 1
+    }
     
     # Configure PgBouncer
-    configure_pgbouncer
+    configure_pgbouncer || {
+        log "ERROR: Failed to configure PgBouncer. Running diagnostics..."
+        run_diagnostics
+        log "Please fix the issues and try again."
+        exit 1
+    }
     
     # Configure firewall
     configure_firewall
@@ -529,20 +697,35 @@ main() {
     configure_fail2ban
     
     # Create demo database
-    create_demo_db
+    create_demo_db || {
+        log "WARNING: Failed to create demo database. Continuing..."
+    }
     
     # Setup monitoring
-    setup_monitoring
+    setup_monitoring || {
+        log "WARNING: Failed to set up monitoring. Continuing..."
+    }
     
     # Restart services
     log "Restarting PostgreSQL and PgBouncer"
     
     # Restart PostgreSQL and wait for it to be ready
-    systemctl restart postgresql
-    wait_for_postgresql
+    systemctl restart postgresql || {
+        log "Failed to restart PostgreSQL with systemctl. Trying to start manually."
+        sudo -u postgres pg_ctl -D "/var/lib/postgresql/$PG_VERSION/main" -l "/var/log/postgresql/postgresql-$PG_VERSION-manual.log" start
+    }
+    
+    if ! wait_for_postgresql; then
+        log "ERROR: PostgreSQL failed to start after configuration. Running diagnostics..."
+        run_diagnostics
+        log "Please fix the issues and try again."
+        exit 1
+    fi
     
     # Restart PgBouncer
-    systemctl restart pgbouncer
+    systemctl restart pgbouncer || {
+        log "WARNING: Failed to restart PgBouncer. Continuing..."
+    }
     
     log "Server initialization complete"
     log "PostgreSQL version $PG_VERSION installed and configured"
@@ -600,6 +783,7 @@ usage() {
     echo "Server Initialization Script"
     echo "Usage:"
     echo "  $0 install                - Install and configure PostgreSQL and PgBouncer"
+    echo "  $0 diagnostics            - Run diagnostics on PostgreSQL installation"
     echo "  $0 help                   - Display this help message"
 }
 
@@ -607,6 +791,9 @@ usage() {
 case "$1" in
     install)
         main
+        ;;
+    diagnostics)
+        run_diagnostics
         ;;
     help|--help|-h)
         usage
