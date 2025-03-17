@@ -100,7 +100,7 @@ check_postgresql_logs() {
         ls -la /var/lib/postgresql/$PG_VERSION/main/
     elif grep -q "database system is shut down" "$recent_log"; then
         log "ERROR: PostgreSQL database system is shut down. Trying to initialize..."
-        sudo -u postgres pg_ctl -D /var/lib/postgresql/$PG_VERSION/main init
+        pg_ctlcluster $PG_VERSION main start || log "Failed to start PostgreSQL cluster with pg_ctlcluster"
     fi
     
     # Display the last 20 lines of the log
