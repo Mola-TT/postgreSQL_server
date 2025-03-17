@@ -264,161 +264,133 @@ update_system() {
 }
 
 # Function to install PostgreSQL and PgBouncer
-install_postgres() {
+install_postgresql() {
     log "Installing PostgreSQL $PG_VERSION and PgBouncer"
     
+    # Add PostgreSQL repository key
+    wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/postgresql.gpg > /dev/null
+    
     # Add PostgreSQL repository
-    if [ ! -f /etc/apt/sources.list.d/pgdg.list ]; then
-        log "Adding PostgreSQL repository"
-        echo "deb [signed-by=/etc/apt/trusted.gpg.d/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/postgresql.gpg > /dev/null
-        apt-get update
-    fi
+    echo "deb [signed-by=/etc/apt/trusted.gpg.d/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+    
+    # Update package lists
+    apt-get update
     
     # Install PostgreSQL and PgBouncer
     apt-get install -y postgresql-$PG_VERSION postgresql-client-$PG_VERSION pgbouncer
     
     # Wait for PostgreSQL to initialize
+    log "Waiting for PostgreSQL to initialize..."
     sleep 10
+    
+    # Check if PostgreSQL is running properly
+    if ! sudo -u postgres pg_isready -q; then
+        log "PostgreSQL is not running properly after installation. Attempting to fix..."
+        fix_postgresql_cluster
+    fi
     
     log "PostgreSQL and PgBouncer installation complete"
 }
 
 # Function to configure PostgreSQL
-configure_postgres() {
+configure_postgresql() {
     log "Configuring PostgreSQL"
     
-    # Check if PostgreSQL configuration directory exists
-    if [ ! -d "/etc/postgresql/$PG_VERSION/main" ]; then
-        log "PostgreSQL configuration directory does not exist. Creating it."
-        mkdir -p "/etc/postgresql/$PG_VERSION/main"
-        chown postgres:postgres "/etc/postgresql/$PG_VERSION/main"
+    # Check if PostgreSQL is running
+    if ! systemctl is-active --quiet postgresql; then
+        log "PostgreSQL service is not running. Attempting to start..."
+        systemctl start postgresql
+        sleep 5
+        
+        if ! systemctl is-active --quiet postgresql; then
+            log "Failed to start PostgreSQL service. Attempting to fix cluster..."
+            fix_postgresql_cluster
+            
+            if ! systemctl is-active --quiet postgresql; then
+                log "ERROR: Failed to start PostgreSQL service after fix attempts"
+                return 1
+            fi
+        fi
     fi
     
-    # Check if PostgreSQL is installed properly
-    if ! command_exists psql || ! systemctl is-enabled postgresql; then
-        log "PostgreSQL not installed properly. Reinstalling."
-        apt-get install --reinstall -y postgresql-$PG_VERSION
-        sleep 10
-    fi
+    # Enable PostgreSQL to start on boot
+    systemctl enable postgresql
+    log "$(systemctl is-enabled postgresql)"
     
-    # Check if postgresql.conf exists
-    if [ ! -f "/etc/postgresql/$PG_VERSION/main/postgresql.conf" ]; then
-        log "postgresql.conf does not exist. Creating a basic configuration."
-        cat > "/etc/postgresql/$PG_VERSION/main/postgresql.conf" << EOF
-# Basic PostgreSQL configuration
-data_directory = '/var/lib/postgresql/$PG_VERSION/main'
-hba_file = '/etc/postgresql/$PG_VERSION/main/pg_hba.conf'
-ident_file = '/etc/postgresql/$PG_VERSION/main/pg_ident.conf'
-
-# Connection settings
-listen_addresses = 'localhost'
-port = 5432
-max_connections = 100
-superuser_reserved_connections = 3
-
-# Memory settings
-shared_buffers = 128MB
-work_mem = 4MB
-maintenance_work_mem = 64MB
-
-# Write ahead log
-wal_level = replica
-max_wal_senders = 10
-wal_keep_size = 1GB
-
-# Background writer
-bgwriter_delay = 200ms
-bgwriter_lru_maxpages = 100
-bgwriter_lru_multiplier = 2.0
-
-# Logging
-log_destination = 'stderr'
-logging_collector = on
-log_directory = 'log'
-log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
-log_rotation_age = 1d
-log_rotation_size = 10MB
-log_min_duration_statement = 1000
-log_checkpoints = on
-log_connections = on
-log_disconnections = on
-log_lock_waits = on
-log_temp_files = 0
-log_autovacuum_min_duration = 0
-
-# Autovacuum
-autovacuum = on
-autovacuum_max_workers = 3
-autovacuum_naptime = 1min
-autovacuum_vacuum_threshold = 50
-autovacuum_analyze_threshold = 50
-autovacuum_vacuum_scale_factor = 0.2
-autovacuum_analyze_scale_factor = 0.1
-autovacuum_vacuum_cost_delay = 20ms
-autovacuum_vacuum_cost_limit = 200
-
-# Statement behavior
-search_path = '"$user", public'
-default_tablespace = ''
-temp_tablespaces = ''
-EOF
-        chown postgres:postgres "/etc/postgresql/$PG_VERSION/main/postgresql.conf"
-    fi
-    
-    # Configure PostgreSQL to listen on appropriate interfaces
+    # Configure PostgreSQL for local or remote access
     if [ "$ENABLE_REMOTE_ACCESS" = true ]; then
         log "Configuring PostgreSQL for remote access"
-        sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "/etc/postgresql/$PG_VERSION/main/postgresql.conf"
+        sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
     else
         log "Configuring PostgreSQL for local access only"
-        sed -i "s/^#\?listen_addresses.*/listen_addresses = 'localhost'/" "/etc/postgresql/$PG_VERSION/main/postgresql.conf"
+        sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = 'localhost'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
     fi
     
     # Configure PostgreSQL authentication
     log "Configuring PostgreSQL authentication"
-    cat > "/etc/postgresql/$PG_VERSION/main/pg_hba.conf" << EOF
+    
+    # Backup original pg_hba.conf
+    PG_HBA_BACKUP="/etc/postgresql/$PG_VERSION/main/pg_hba.conf.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
+    cp /etc/postgresql/$PG_VERSION/main/pg_hba.conf "$PG_HBA_BACKUP"
+    
+    # Update pg_hba.conf to use SCRAM-SHA-256 authentication
+    cat > /etc/postgresql/$PG_VERSION/main/pg_hba.conf << EOF
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
-# "local" is for Unix domain socket connections only
 local   all             postgres                                peer
-local   all             all                                     md5
-# IPv4 local connections:
-host    all             all             127.0.0.1/32            md5
-# IPv6 local connections:
-host    all             all             ::1/128                 md5
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
 EOF
-    chown postgres:postgres "/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
     
     # Add remote access if enabled
     if [ "$ENABLE_REMOTE_ACCESS" = true ]; then
-        echo "# Allow remote connections from trusted networks:" >> "/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
-        echo "host    all             all             0.0.0.0/0               md5" >> "/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
+        echo "host    all             all             0.0.0.0/0               scram-sha-256" >> /etc/postgresql/$PG_VERSION/main/pg_hba.conf
     fi
+    
+    # Configure PostgreSQL settings
+    log "Configuring PostgreSQL settings"
+    
+    # Backup original postgresql.conf
+    PG_CONF_BACKUP="/etc/postgresql/$PG_VERSION/main/postgresql.conf.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
+    cp /etc/postgresql/$PG_VERSION/main/postgresql.conf "$PG_CONF_BACKUP"
+    
+    # Update postgresql.conf
+    sed -i "s/^#password_encryption = .*/password_encryption = 'scram-sha-256'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
     
     # Restart PostgreSQL to apply configuration changes
     log "Restarting PostgreSQL to apply configuration changes"
-    systemctl restart postgresql || {
-        log "Failed to restart PostgreSQL with systemctl. Trying to start manually."
-        sudo -u postgres pg_ctl -D "/var/lib/postgresql/$PG_VERSION/main" -l "/var/log/postgresql/postgresql-$PG_VERSION-manual.log" start
-    }
+    systemctl restart postgresql
     
     # Wait for PostgreSQL to be ready
-    if ! wait_for_postgresql; then
-        log "ERROR: PostgreSQL failed to start. Exiting."
-        exit 1
-    fi
+    log "Waiting for PostgreSQL to be ready..."
+    attempt=1
+    max_attempts=30
+    while ! sudo -u postgres pg_isready -q; do
+        if [ $attempt -ge $max_attempts ]; then
+            log "ERROR: PostgreSQL did not become ready after $max_attempts attempts"
+            return 1
+        fi
+        log "PostgreSQL not ready yet (attempt $attempt/$max_attempts). Waiting..."
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    
+    log "PostgreSQL is now ready"
     
     # Set PostgreSQL password
-    log "Setting PostgreSQL password"
-    if ! sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';" 2>/dev/null; then
-        log "Failed to set PostgreSQL password. Trying again after restart."
-        systemctl restart postgresql
-        sleep 10
-        wait_for_postgresql
-        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+    if [ -n "$POSTGRES_PASSWORD" ]; then
+        log "Setting PostgreSQL password"
+        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$POSTGRES_PASSWORD';"
+    else
+        log "WARNING: POSTGRES_PASSWORD not set. Skipping password configuration."
     fi
     
+    # Revoke public schema privileges
+    log "Revoking public schema privileges"
+    sudo -u postgres psql -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+    
     log "PostgreSQL configuration complete"
+    return 0
 }
 
 # Function to configure PgBouncer
@@ -537,7 +509,7 @@ EOF
 }
 
 # Function to create a demo database and user
-create_demo_db() {
+create_demo_database() {
     log "Creating demo database and user"
     
     # Wait for PostgreSQL to be ready
@@ -642,23 +614,109 @@ run_diagnostics() {
     log "PostgreSQL log directory:"
     ls -la /var/log/postgresql/ || log "Failed to list PostgreSQL log directory"
     
-    # Check PostgreSQL port
+    # Check if PostgreSQL port is in use
     log "Checking if PostgreSQL port is in use:"
-    if command_exists lsof; then
-        lsof -i :5432 || log "No process found using port 5432 with lsof"
-    fi
-    if command_exists netstat; then
-        netstat -tuln | grep 5432 || log "No process found using port 5432 with netstat"
-    fi
+    lsof -i :5432 || log "No process found using port 5432 with lsof"
     
     # Check if PostgreSQL is accepting connections
     log "Checking if PostgreSQL is accepting connections:"
-    sudo -u postgres pg_isready -v || log "PostgreSQL is not accepting connections"
+    sudo -u postgres pg_isready || log "PostgreSQL is not accepting connections"
     
-    # Check PostgreSQL logs
+    # Check PostgreSQL logs for errors
     check_postgresql_logs
     
-    log "Diagnostics complete"
+    # If PostgreSQL is not running, try to fix it
+    if ! sudo -u postgres pg_isready -q; then
+        log "Attempting to fix PostgreSQL cluster..."
+        fix_postgresql_cluster
+    fi
+}
+
+# Function to fix PostgreSQL cluster issues
+fix_postgresql_cluster() {
+    log "Fixing PostgreSQL cluster issues"
+    
+    # Check if cluster exists but is down
+    if pg_lsclusters | grep -q "down"; then
+        log "PostgreSQL cluster exists but is down. Attempting to start it..."
+        
+        # Try to start the cluster
+        if pg_ctlcluster $PG_VERSION main start; then
+            log "Successfully started PostgreSQL cluster"
+            return 0
+        else
+            log "Failed to start PostgreSQL cluster with pg_ctlcluster. Trying alternative methods..."
+        fi
+    fi
+    
+    # Check if data directory is initialized
+    if [ -f "/var/lib/postgresql/$PG_VERSION/main/PG_VERSION" ]; then
+        log "PostgreSQL data directory is initialized but cluster won't start. Checking permissions..."
+        
+        # Fix permissions
+        chown -R postgres:postgres /var/lib/postgresql/$PG_VERSION/main
+        chmod 700 /var/lib/postgresql/$PG_VERSION/main
+        
+        # Try starting with pg_ctl directly
+        log "Starting PostgreSQL with pg_ctl directly..."
+        sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/pg_ctl -D /var/lib/postgresql/$PG_VERSION/main start
+        
+        # Wait a bit and check if it's running
+        sleep 5
+        if sudo -u postgres pg_isready -q; then
+            log "Successfully started PostgreSQL with pg_ctl"
+            return 0
+        else
+            log "Failed to start PostgreSQL with pg_ctl"
+        fi
+    else
+        log "PostgreSQL data directory is not properly initialized. Initializing..."
+        
+        # Initialize the data directory
+        sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/initdb -D /var/lib/postgresql/$PG_VERSION/main
+        
+        # Try to start the cluster
+        pg_ctlcluster $PG_VERSION main start
+        
+        # Wait a bit and check if it's running
+        sleep 5
+        if sudo -u postgres pg_isready -q; then
+            log "Successfully initialized and started PostgreSQL cluster"
+            return 0
+        else
+            log "Failed to initialize and start PostgreSQL cluster"
+        fi
+    fi
+    
+    # If we get here, try recreating the cluster
+    log "Attempting to recreate PostgreSQL cluster..."
+    
+    # Stop PostgreSQL service
+    systemctl stop postgresql
+    
+    # Backup existing data if it exists
+    if [ -d "/var/lib/postgresql/$PG_VERSION/main" ]; then
+        BACKUP_DIR="/var/lib/postgresql/$PG_VERSION/main_backup_$(TZ=Asia/Singapore date +%Y%m%d%H%M%S)"
+        log "Backing up existing data directory to $BACKUP_DIR"
+        mv /var/lib/postgresql/$PG_VERSION/main $BACKUP_DIR
+    fi
+    
+    # Create new cluster
+    log "Creating new PostgreSQL cluster..."
+    pg_createcluster $PG_VERSION main
+    
+    # Start the cluster
+    pg_ctlcluster $PG_VERSION main start
+    
+    # Wait a bit and check if it's running
+    sleep 5
+    if sudo -u postgres pg_isready -q; then
+        log "Successfully recreated and started PostgreSQL cluster"
+        return 0
+    else
+        log "Failed to recreate and start PostgreSQL cluster"
+        return 1
+    fi
 }
 
 # Main function
@@ -672,39 +730,32 @@ main() {
     update_system
     
     # Install PostgreSQL and PgBouncer
-    install_postgres
+    install_postgresql
+    
+    # Check if PostgreSQL is running properly
+    if ! sudo -u postgres pg_isready -q; then
+        log "PostgreSQL is not running properly. Attempting to fix..."
+        fix_postgresql_cluster
+        
+        # Check again after fix attempt
+        if ! sudo -u postgres pg_isready -q; then
+            log "ERROR: PostgreSQL is still not running properly after fix attempts"
+            log "Please check the logs and run the diagnostics command for more information"
+            exit 1
+        fi
+    fi
     
     # Configure PostgreSQL
-    configure_postgres || {
-        log "ERROR: Failed to configure PostgreSQL. Running diagnostics..."
-        run_diagnostics
-        log "Please fix the issues and try again."
-        exit 1
-    }
+    configure_postgresql
     
     # Configure PgBouncer
-    configure_pgbouncer || {
-        log "ERROR: Failed to configure PgBouncer. Running diagnostics..."
-        run_diagnostics
-        log "Please fix the issues and try again."
-        exit 1
-    }
-    
-    # Configure firewall
-    configure_firewall
-    
-    # Configure fail2ban
-    configure_fail2ban
+    configure_pgbouncer
     
     # Create demo database
-    create_demo_db || {
-        log "WARNING: Failed to create demo database. Continuing..."
-    }
+    create_demo_database
     
     # Setup monitoring
-    setup_monitoring || {
-        log "WARNING: Failed to set up monitoring. Continuing..."
-    }
+    setup_monitoring
     
     # Restart services
     log "Restarting PostgreSQL and PgBouncer"
