@@ -468,23 +468,25 @@ configure_pgbouncer() {
 [pgbouncer]
 logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
-listen_addr = 127.0.0.1
-listen_port = 6432
+listen_addr = *
+listen_port = ${PGBOUNCER_PORT:-6432}
 auth_type = md5
 auth_file = /etc/pgbouncer/userlist.txt
 admin_users = postgres
 stats_users = postgres
-pool_mode = transaction
+pool_mode = ${POOL_MODE:-transaction}
 server_reset_query = DISCARD ALL
-max_client_conn = 1000
-default_pool_size = 20
+max_client_conn = ${MAX_CLIENT_CONN:-1000}
+default_pool_size = ${DEFAULT_POOL_SIZE:-20}
 min_pool_size = 0
-reserve_pool_size = 5
+reserve_pool_size = ${RESERVE_POOL_SIZE:-5}
 reserve_pool_timeout = 3
 max_db_connections = 50
 max_user_connections = 50
 server_round_robin = 0
 EOF
+    
+    log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     
     # Create PgBouncer user list
     log "Creating PgBouncer user list"
@@ -512,31 +514,38 @@ configure_firewall() {
     
     # Check if UFW is installed
     if ! command_exists ufw; then
-        log "UFW is not installed. Installing..."
+        log "UFW not installed. Installing..."
         apt-get install -y ufw
     fi
     
-    # Enable UFW
-    log "Enabling UFW firewall"
-    ufw --force enable
-    
-    # Allow SSH
-    log "Adding SSH rule to firewall"
-    ufw allow ssh
-    
-    # Always allow PostgreSQL ports for better flexibility
-    # This ensures both local and remote tools can connect
-    log "Opening PostgreSQL ports in firewall"
-    ufw allow 5432/tcp
-    ufw allow 6432/tcp
-    
-    # Show firewall status
-    log "Firewall status:"
-    ufw status | while read line; do
-        log "  $line"
-    done
-    
-    log "Firewall configuration complete"
+    # Check if firewall should be enabled
+    if [ "${ENABLE_FIREWALL:-true}" = "true" ]; then
+        log "Configuring UFW firewall"
+        
+        # Allow SSH
+        ufw allow ssh
+        
+        # Allow PostgreSQL
+        if [ "${ENABLE_REMOTE_ACCESS:-false}" = "true" ]; then
+            log "Enabling remote access to PostgreSQL (port 5432)"
+            ufw allow 5432/tcp
+            
+            log "Enabling remote access to PgBouncer (port ${PGBOUNCER_PORT:-6432})"
+            ufw allow ${PGBOUNCER_PORT:-6432}/tcp
+        else
+            log "Remote access disabled. Only allowing local connections."
+        fi
+        
+        # Enable UFW if not already enabled
+        if ! ufw status | grep -q "Status: active"; then
+            log "Enabling UFW firewall"
+            echo "y" | ufw enable
+        fi
+        
+        log "UFW firewall configured"
+    else
+        log "Firewall configuration skipped as ENABLE_FIREWALL is set to false"
+    fi
 }
 
 # Function to configure fail2ban
