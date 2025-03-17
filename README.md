@@ -14,10 +14,17 @@ A comprehensive suite of scripts for setting up, managing, and monitoring Postgr
 ## Quick Installation
 
 ```bash
-git clone https://github.com/yourusername/dbhub.cc.git
-cd dbhub.cc
+git clone https://github.com/Mola-TT/postgreSQL_server.git
+cd postgreSQL_server
 cp .env.example .env
 # Edit .env with your settings
+
+# Make scripts executable
+chmod +x server_init.sh
+chmod +x scripts/*.sh
+chmod +x modules/*.sh
+
+# Run the main installation script
 sudo ./server_init.sh
 ```
 
@@ -69,3 +76,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - PgBouncer developers
 - Nginx team
 - All open-source contributors who made this possible
+
+## Repository
+
+GitHub: [@https://github.com/Mola-TT/postgreSQL_server.git](https://github.com/Mola-TT/postgreSQL_server.git)
