@@ -282,7 +282,11 @@ update_system() {
     apt-get update
     apt-get upgrade -y
     
-    # Install required packages
+    log "System update complete"
+}
+
+# Function to install required packages
+install_required_packages() {
     log "Installing required packages"
     apt-get install -y \
         curl \
@@ -297,7 +301,7 @@ update_system() {
         fail2ban \
         unattended-upgrades
     
-    log "System update complete"
+    log "Required packages installed"
 }
 
 # Function to install PostgreSQL and PgBouncer
