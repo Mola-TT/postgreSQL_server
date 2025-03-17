@@ -30,6 +30,7 @@ SMTP_SERVER="smtp.example.com"
 SMTP_PORT="587"
 SMTP_USER="smtp_user"
 SMTP_PASS="smtp_password"
+SMTP_USE_TLS="false"
 
 # SSL certificate settings
 SSL_CERT_VALIDITY=365
@@ -185,26 +186,38 @@ wait_for_postgresql() {
 
 # Function to create or load environment file
 setup_env_file() {
-    ENV_FILE="/etc/dbhub/.env"
-    ENV_BACKUP_FILE="/etc/dbhub/.env.backup.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S)"
+    # First check for local .env file in current directory
+    LOCAL_ENV_FILE="./.env"
     
-    # Create directory if it doesn't exist
-    if [ ! -d "/etc/dbhub" ]; then
-        log "Creating /etc/dbhub directory"
-        mkdir -p /etc/dbhub
-        chmod 750 /etc/dbhub
+    if [ -f "$LOCAL_ENV_FILE" ]; then
+        log "Found local .env file in current directory"
+        ENV_FILE="$LOCAL_ENV_FILE"
+    else
+        # Use system-wide env file
+        ENV_FILE="/etc/dbhub/.env"
+        
+        # Create directory if it doesn't exist
+        if [ ! -d "/etc/dbhub" ]; then
+            log "Creating /etc/dbhub directory"
+            mkdir -p /etc/dbhub
+            chmod 750 /etc/dbhub
+        fi
     fi
+    
+    ENV_BACKUP_FILE="${ENV_FILE}.backup.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S)"
     
     # If .env file exists, back it up
     if [ -f "$ENV_FILE" ]; then
         log "Backing up existing .env file to $ENV_BACKUP_FILE"
         cp "$ENV_FILE" "$ENV_BACKUP_FILE"
         log "Loading environment variables from $ENV_FILE"
+        set -a
         source "$ENV_FILE"
+        set +a
         log "Environment variables loaded"
     else
         # Create new .env file
-        log "Creating new .env file"
+        log "Creating new .env file at $ENV_FILE"
         cat > "$ENV_FILE" << EOF
 # Database settings
 PG_VERSION=$PG_VERSION
@@ -224,6 +237,7 @@ SMTP_SERVER=$SMTP_SERVER
 SMTP_PORT=$SMTP_PORT
 SMTP_USER=$SMTP_USER
 SMTP_PASS=$SMTP_PASS
+SMTP_USE_TLS=$SMTP_USE_TLS
 
 # Domain settings
 DOMAIN_SUFFIX=$DOMAIN_SUFFIX
@@ -238,7 +252,9 @@ SSL_ORGANIZATION=$SSL_ORGANIZATION
 SSL_COMMON_NAME=$SSL_COMMON_NAME
 EOF
         log "Loading environment variables from newly created $ENV_FILE"
+        set -a
         source "$ENV_FILE"
+        set +a
         log "Environment variables loaded"
     fi
     
@@ -251,6 +267,13 @@ EOF
     log "PostgreSQL version: $PG_VERSION"
     log "Remote access enabled: $ENABLE_REMOTE_ACCESS"
     log "Demo database enabled: $CREATE_DEMO_DB"
+    
+    # Debug: Print email settings to verify they're loaded
+    log "Email settings loaded:"
+    log "  EMAIL_RECIPIENT: $EMAIL_RECIPIENT"
+    log "  EMAIL_SENDER: $EMAIL_SENDER"
+    log "  SMTP_SERVER: $SMTP_SERVER"
+    log "  SMTP_PORT: $SMTP_PORT"
 }
 
 # Function to update system packages
@@ -777,6 +800,7 @@ send_email() {
     
     if [ -n "$EMAIL_RECIPIENT" ] && [ -n "$EMAIL_SENDER" ] && [ -n "$SMTP_SERVER" ] && [ -n "$SMTP_PORT" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASS" ]; then
         log "Sending email to $EMAIL_RECIPIENT: $subject"
+        log "Using SMTP server: $SMTP_SERVER:$SMTP_PORT"
         
         # Create email content
         local email_content="From: $EMAIL_SENDER
@@ -790,11 +814,18 @@ $message
 
 --
 This is an automated message from your DBHub.cc server.
-Time: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
+Time: $(TZ=${TIMEZONE:-Asia/Singapore} date +'%Y-%m-%d %H:%M:%S')
 "
         
-        # Send email using curl with SSL
-        if curl --silent --show-error --url "smtps://$SMTP_SERVER:$SMTP_PORT" \
+        # Determine protocol based on SMTP_USE_TLS
+        local protocol="smtp"
+        if [ "${SMTP_USE_TLS}" = "true" ]; then
+            protocol="smtps"
+            log "Using secure SMTP connection (TLS)"
+        fi
+        
+        # Send email using curl with appropriate protocol
+        if curl --silent --show-error --url "${protocol}://$SMTP_SERVER:$SMTP_PORT" \
              --ssl-reqd \
              --mail-from "$EMAIL_SENDER" \
              --mail-rcpt "$EMAIL_RECIPIENT" \
@@ -804,11 +835,22 @@ Time: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
             return 0
         else
             log "Failed to send email to $EMAIL_RECIPIENT"
+            log "SMTP Server: $SMTP_SERVER"
+            log "SMTP Port: $SMTP_PORT"
+            log "SMTP User: $SMTP_USER"
+            log "Protocol: $protocol"
             return 1
         fi
     else
         log "Email configuration not complete, skipping email notification"
         log "Please set EMAIL_RECIPIENT, EMAIL_SENDER, SMTP_SERVER, SMTP_PORT, SMTP_USER, and SMTP_PASS in your .env file"
+        log "Current values:"
+        log "  EMAIL_RECIPIENT: $EMAIL_RECIPIENT"
+        log "  EMAIL_SENDER: $EMAIL_SENDER"
+        log "  SMTP_SERVER: $SMTP_SERVER"
+        log "  SMTP_PORT: $SMTP_PORT"
+        log "  SMTP_USER: $SMTP_USER"
+        log "  SMTP_PASS: ${SMTP_PASS:+[set]}"
         return 1
     fi
 }
@@ -857,7 +899,7 @@ Configuration Files:
 ------------------
 PostgreSQL Config: /etc/postgresql/$PG_VERSION/main/postgresql.conf
 PgBouncer Config: /etc/pgbouncer/pgbouncer.ini
-Environment File: /etc/dbhub/.env
+Environment File: $ENV_FILE
 Log Directory: $LOG_DIR
 
 Setup completed at: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
@@ -876,6 +918,9 @@ main() {
     
     # Update system
     update_system
+    
+    # Install required packages
+    install_required_packages
     
     # Install PostgreSQL and PgBouncer
     install_postgresql
@@ -941,7 +986,7 @@ main() {
     echo "PgBouncer port: 6432"
     echo "Remote access: $ENABLE_REMOTE_ACCESS"
     echo "Log directory: $LOG_DIR"
-    echo "Environment file: /etc/dbhub/.env"
+    echo "Environment file: $ENV_FILE"
     echo "Monitoring scripts: /opt/dbhub/scripts/"
     echo "===================================="
     
@@ -982,7 +1027,7 @@ PgBouncer Port: 6432
 Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@$(curl -s ifconfig.me || hostname -I | awk '{print $1}'):5432/${DEMO_DB_NAME:-demo}
 PgBouncer Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@$(curl -s ifconfig.me || hostname -I | awk '{print $1}'):6432/${DEMO_DB_NAME:-demo}
 
-Generated: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
+Generated: $(TZ=${TIMEZONE:-Asia/Singapore} date +'%Y-%m-%d %H:%M:%S')
 EOF
     
     log "Connection information saved to $CONNECTION_INFO_FILE"
@@ -995,6 +1040,14 @@ EOF
     log "Demo Database: ${DEMO_DB_NAME:-demo}"
     log "Demo Username: ${DEMO_DB_USER:-demo}"
     log "Demo Password: ${DEMO_DB_PASSWORD:-demo}"
+    
+    # Reload environment variables to ensure we have the latest values
+    if [ -f "$ENV_FILE" ]; then
+        log "Reloading environment variables before sending notification"
+        set -a
+        source "$ENV_FILE"
+        set +a
+    fi
     
     # Send completion notification email
     send_completion_notification
