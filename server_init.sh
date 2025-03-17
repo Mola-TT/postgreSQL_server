@@ -199,6 +199,9 @@ setup_env_file() {
     if [ -f "$ENV_FILE" ]; then
         log "Backing up existing .env file to $ENV_BACKUP_FILE"
         cp "$ENV_FILE" "$ENV_BACKUP_FILE"
+        log "Loading environment variables from $ENV_FILE"
+        source "$ENV_FILE"
+        log "Environment variables loaded"
     else
         # Create new .env file
         log "Creating new .env file"
@@ -224,7 +227,7 @@ SMTP_PASS=$SMTP_PASS
 
 # Domain settings
 DOMAIN_SUFFIX=$DOMAIN_SUFFIX
-ENABLE_REMOTE_ACCESS=$ENABLE_REMOTE_ACCESS
+ENABLE_REMOTE_ACCESS=true
 
 # SSL settings
 SSL_CERT_VALIDITY=$SSL_CERT_VALIDITY
@@ -234,15 +237,20 @@ SSL_LOCALITY=$SSL_LOCALITY
 SSL_ORGANIZATION=$SSL_ORGANIZATION
 SSL_COMMON_NAME=$SSL_COMMON_NAME
 EOF
+        log "Loading environment variables from newly created $ENV_FILE"
+        source "$ENV_FILE"
+        log "Environment variables loaded"
     fi
     
     # Set permissions
     chmod 640 "$ENV_FILE"
     
-    # Source the environment file
-    source "$ENV_FILE"
-    
     log "Environment file setup complete"
+    
+    # Display important settings
+    log "PostgreSQL version: $PG_VERSION"
+    log "Remote access enabled: $ENABLE_REMOTE_ACCESS"
+    log "Demo database enabled: $CREATE_DEMO_DB"
 }
 
 # Function to update system packages
@@ -324,13 +332,16 @@ configure_postgresql() {
     log "$(systemctl is-enabled postgresql)"
     
     # Configure PostgreSQL for local or remote access
-    if [ "$ENABLE_REMOTE_ACCESS" = true ]; then
-        log "Configuring PostgreSQL for remote access"
-        sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
-    else
-        log "Configuring PostgreSQL for local access only"
-        sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = 'localhost'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
-    fi
+    log "Configuring PostgreSQL network settings"
+    
+    # Backup original postgresql.conf
+    PG_CONF_BACKUP="/etc/postgresql/$PG_VERSION/main/postgresql.conf.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
+    cp /etc/postgresql/$PG_VERSION/main/postgresql.conf "$PG_CONF_BACKUP"
+    
+    # Always configure PostgreSQL to listen on all interfaces for better flexibility
+    # Security will be controlled via pg_hba.conf
+    sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
+    log "PostgreSQL configured to listen on all interfaces"
     
     # Configure PostgreSQL authentication
     log "Configuring PostgreSQL authentication"
@@ -350,17 +361,18 @@ EOF
     
     # Add remote access if enabled
     if [ "$ENABLE_REMOTE_ACCESS" = true ]; then
+        log "Enabling remote access in PostgreSQL configuration"
         echo "host    all             all             0.0.0.0/0               scram-sha-256" >> /etc/postgresql/$PG_VERSION/main/pg_hba.conf
+        log "Remote access enabled in PostgreSQL configuration"
+    else
+        log "Remote access is disabled. PostgreSQL will only accept local connections."
+        log "To enable remote access, set ENABLE_REMOTE_ACCESS=true in your .env file and run the script again."
     fi
     
     # Configure PostgreSQL settings
-    log "Configuring PostgreSQL settings"
+    log "Configuring PostgreSQL security settings"
     
-    # Backup original postgresql.conf
-    PG_CONF_BACKUP="/etc/postgresql/$PG_VERSION/main/postgresql.conf.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
-    cp /etc/postgresql/$PG_VERSION/main/postgresql.conf "$PG_CONF_BACKUP"
-    
-    # Update postgresql.conf
+    # Update postgresql.conf for SCRAM-SHA-256 authentication
     sed -i "s/^#password_encryption = .*/password_encryption = 'scram-sha-256'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
     
     # Restart PostgreSQL to apply configuration changes
@@ -384,11 +396,12 @@ EOF
     log "PostgreSQL is now ready"
     
     # Set PostgreSQL password
-    if [ -n "$POSTGRES_PASSWORD" ]; then
+    if [ -n "$PG_PASSWORD" ]; then
         log "Setting PostgreSQL password"
-        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$POSTGRES_PASSWORD';"
+        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+        log "PostgreSQL password set successfully"
     else
-        log "WARNING: POSTGRES_PASSWORD not set. Skipping password configuration."
+        log "WARNING: PG_PASSWORD not set. Skipping password configuration."
     fi
     
     # Revoke public schema privileges
@@ -470,16 +483,31 @@ EOF
 configure_firewall() {
     log "Configuring firewall"
     
+    # Check if UFW is installed
+    if ! command_exists ufw; then
+        log "UFW is not installed. Installing..."
+        apt-get install -y ufw
+    fi
+    
     # Enable UFW
+    log "Enabling UFW firewall"
     ufw --force enable
     
     # Allow SSH
+    log "Adding SSH rule to firewall"
     ufw allow ssh
     
-    # Allow PostgreSQL ports
+    # Always allow PostgreSQL ports for better flexibility
+    # This ensures both local and remote tools can connect
     log "Opening PostgreSQL ports in firewall"
     ufw allow 5432/tcp
     ufw allow 6432/tcp
+    
+    # Show firewall status
+    log "Firewall status:"
+    ufw status | while read line; do
+        log "  $line"
+    done
     
     log "Firewall configuration complete"
 }
@@ -844,10 +872,27 @@ Password: ${DEMO_DB_PASSWORD:-demo}
 Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@localhost:5432/${DEMO_DB_NAME:-demo}
 PgBouncer Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@localhost:6432/${DEMO_DB_NAME:-demo}
 
+External Connection:
+------------------
+Host: $(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+PostgreSQL Port: 5432
+PgBouncer Port: 6432
+Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@$(curl -s ifconfig.me || hostname -I | awk '{print $1}'):5432/${DEMO_DB_NAME:-demo}
+PgBouncer Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@$(curl -s ifconfig.me || hostname -I | awk '{print $1}'):6432/${DEMO_DB_NAME:-demo}
+
 Generated: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
 EOF
     
     log "Connection information saved to $CONNECTION_INFO_FILE"
+    
+    # Display external connection information
+    log "External connection information:"
+    log "Host: $(curl -s ifconfig.me || hostname -I | awk '{print $1}')"
+    log "PostgreSQL Port: 5432"
+    log "PgBouncer Port: 6432"
+    log "Demo Database: ${DEMO_DB_NAME:-demo}"
+    log "Demo Username: ${DEMO_DB_USER:-demo}"
+    log "Demo Password: ${DEMO_DB_PASSWORD:-demo}"
 }
 
 # Display usage information
