@@ -31,6 +31,43 @@ install_postgresql() {
     # Wait for PostgreSQL to initialize
     log "Waiting for PostgreSQL to initialize"
     sleep 5
+    
+    # Ensure the correct service is enabled and started
+    PG_SERVICE="postgresql@$PG_VERSION-main"
+    if systemctl list-unit-files | grep -q "$PG_SERVICE"; then
+        log "Enabling and starting $PG_SERVICE"
+        systemctl enable $PG_SERVICE
+        systemctl start $PG_SERVICE
+    else
+        log "Enabling and starting postgresql service"
+        systemctl enable postgresql
+        systemctl start postgresql
+    fi
+    
+    # Wait for PostgreSQL to start
+    log "Waiting for PostgreSQL to start"
+    for i in {1..30}; do
+        if pg_isready -q; then
+            log "PostgreSQL is ready"
+            break
+        fi
+        log "Waiting for PostgreSQL to become ready... ($i/30)"
+        sleep 2
+    done
+    
+    if ! pg_isready -q; then
+        log "ERROR: PostgreSQL failed to start within the timeout period"
+        log "Checking PostgreSQL cluster status:"
+        pg_lsclusters
+        
+        # Try to create a cluster if none exists
+        if ! pg_lsclusters | grep -q "$PG_VERSION main"; then
+            log "No PostgreSQL cluster found, creating one"
+            pg_createcluster $PG_VERSION main
+            systemctl start postgresql@$PG_VERSION-main
+            sleep 5
+        fi
+    fi
 }
 
 # Function to configure PostgreSQL
@@ -44,12 +81,36 @@ configure_postgresql() {
         mkdir -p "$PG_CONF_DIR"
     fi
     
-    # Check if PostgreSQL is properly installed
-    if ! service_running "postgresql"; then
-        log "PostgreSQL service not running, attempting to reinstall"
-        apt-get install --reinstall -y postgresql-$PG_VERSION
-        systemctl start postgresql
+    # Check if PostgreSQL is properly installed and running
+    if ! pg_isready -q; then
+        log "PostgreSQL service not running, checking cluster status"
+        pg_lsclusters
+        
+        # Try to start the specific cluster
+        if pg_lsclusters | grep -q "$PG_VERSION main"; then
+            log "Starting PostgreSQL cluster $PG_VERSION main"
+            pg_ctlcluster $PG_VERSION main start
+        else
+            log "No PostgreSQL cluster found, creating one"
+            pg_createcluster $PG_VERSION main
+            pg_ctlcluster $PG_VERSION main start
+        fi
+        
         sleep 5
+        
+        # If still not running, try reinstalling
+        if ! pg_isready -q; then
+            log "PostgreSQL still not running, attempting to reinstall"
+            apt-get install --reinstall -y postgresql-$PG_VERSION
+            
+            # Try to start the service again
+            if systemctl list-unit-files | grep -q "postgresql@$PG_VERSION-main"; then
+                systemctl start postgresql@$PG_VERSION-main
+            else
+                systemctl start postgresql
+            fi
+            sleep 5
+        fi
     fi
     
     # Check if PostgreSQL configuration file exists
@@ -101,7 +162,13 @@ EOF
     
     # Configure PostgreSQL client authentication
     log "Configuring PostgreSQL client authentication"
-    cat > "$PG_CONF_DIR/pg_hba.conf" << EOF
+    PG_HBA_FILE="$PG_CONF_DIR/pg_hba.conf"
+    
+    # Backup pg_hba.conf
+    backup_file "$PG_HBA_FILE"
+    
+    # Configure pg_hba.conf
+    cat > "$PG_HBA_FILE" << EOF
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
 # "local" is for Unix domain socket connections only
 local   all             postgres                                peer
@@ -111,42 +178,65 @@ host    all             all             127.0.0.1/32            scram-sha-256
 # IPv6 local connections:
 host    all             all             ::1/128                 scram-sha-256
 EOF
-
+    
     # Add remote access if enabled
     if [ "$ENABLE_REMOTE_ACCESS" = "true" ]; then
         log "Adding remote access to PostgreSQL"
-        echo "# Allow remote connections with password authentication" >> "$PG_CONF_DIR/pg_hba.conf"
-        echo "host    all             all             0.0.0.0/0               scram-sha-256" >> "$PG_CONF_DIR/pg_hba.conf"
+        echo "# Allow remote connections:" >> "$PG_HBA_FILE"
+        echo "host    all             all             0.0.0.0/0               scram-sha-256" >> "$PG_HBA_FILE"
+        echo "host    all             all             ::/0                    scram-sha-256" >> "$PG_HBA_FILE"
     fi
     
     # Set PostgreSQL password
     log "Setting PostgreSQL password"
-    if service_running "postgresql"; then
-        # Check if we can connect to PostgreSQL
-        if sudo -u postgres psql -c "SELECT 1" > /dev/null 2>&1; then
-            log "Setting PostgreSQL password for postgres user"
-            sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
-        else
-            log "WARNING: Cannot connect to PostgreSQL, skipping password setup"
-        fi
-    else
-        log "WARNING: PostgreSQL is not running, skipping password setup"
-    fi
     
-    # Create PostgreSQL data directory if it doesn't exist
-    PG_DATA_DIR="/var/lib/postgresql/$PG_VERSION/main"
-    if [ ! -d "$PG_DATA_DIR" ]; then
-        log "Creating PostgreSQL data directory: $PG_DATA_DIR"
-        mkdir -p "$PG_DATA_DIR"
-        chown postgres:postgres "$PG_DATA_DIR"
+    # Check if PostgreSQL is running before setting password
+    if pg_isready -q; then
+        log "Setting PostgreSQL password for postgres user"
+        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+    else
+        log "WARNING: PostgreSQL is not running, cannot set password"
+        log "Attempting to start PostgreSQL"
         
-        # Initialize PostgreSQL database
-        log "Initializing PostgreSQL database"
-        sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/initdb -D "$PG_DATA_DIR"
+        # Try to start the specific cluster
+        if pg_lsclusters | grep -q "$PG_VERSION main"; then
+            pg_ctlcluster $PG_VERSION main start
+            sleep 5
+            
+            if pg_isready -q; then
+                log "PostgreSQL started, setting password"
+                sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+            else
+                log "ERROR: Failed to start PostgreSQL, password not set"
+            fi
+        else
+            log "ERROR: No PostgreSQL cluster found, password not set"
+        fi
     fi
     
     # Restart PostgreSQL to apply changes
-    restart_service "postgresql"
+    log "Restarting PostgreSQL to apply configuration changes"
+    if pg_lsclusters | grep -q "$PG_VERSION main"; then
+        pg_ctlcluster $PG_VERSION main restart
+    else
+        if systemctl list-unit-files | grep -q "postgresql@$PG_VERSION-main"; then
+            systemctl restart postgresql@$PG_VERSION-main
+        else
+            systemctl restart postgresql
+        fi
+    fi
+    
+    # Wait for PostgreSQL to restart
+    sleep 5
+    
+    # Verify PostgreSQL is running
+    if pg_isready -q; then
+        log "PostgreSQL successfully restarted and is running"
+    else
+        log "WARNING: PostgreSQL may not be running after restart"
+        log "Current PostgreSQL cluster status:"
+        pg_lsclusters
+    fi
 }
 
 # Function to optimize PostgreSQL settings
@@ -219,7 +309,7 @@ create_restricted_user() {
     log "Creating restricted user $user_name for database $db_name"
     
     # Check if PostgreSQL is running
-    if service_running "postgresql"; then
+    if pg_isready -q; then
         # Check if database exists
         if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$db_name"; then
             log "Creating database $db_name"
@@ -254,6 +344,24 @@ create_restricted_user() {
         return 0
     else
         log "ERROR: PostgreSQL is not running, cannot create user"
-        return 1
+        log "Attempting to start PostgreSQL"
+        
+        # Try to start the specific cluster
+        if pg_lsclusters | grep -q "$PG_VERSION main"; then
+            pg_ctlcluster $PG_VERSION main start
+            sleep 5
+            
+            if pg_isready -q; then
+                log "PostgreSQL started, retrying user creation"
+                create_restricted_user "$db_name" "$user_name" "$password"
+                return $?
+            else
+                log "ERROR: Failed to start PostgreSQL, user not created"
+                return 1
+            fi
+        else
+            log "ERROR: No PostgreSQL cluster found, user not created"
+            return 1
+        fi
     fi
 } 

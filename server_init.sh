@@ -48,21 +48,34 @@ main() {
         log "Monitoring installation skipped (set INSTALL_MONITORING=true to enable)"
     fi
     
-    # Set up subdomain routing
-    setup_subdomain_routing
+    # Set up SSL certificates
+    if [ "$ENABLE_SSL" = "true" ]; then
+        setup_ssl
+    else
+        log "SSL setup skipped (set ENABLE_SSL=true to enable)"
+    fi
     
-    # Create demo database if requested
+    # Set up subdomain routing
+    if [ "$ENABLE_SUBDOMAIN_ROUTING" = "true" ]; then
+        setup_subdomain_routing
+    else
+        log "Subdomain routing skipped (set ENABLE_SUBDOMAIN_ROUTING=true to enable)"
+    fi
+    
+    # Create demo database and user
     if [ "$CREATE_DEMO_DB" = "true" ]; then
         create_demo_database
+    else
+        log "Demo database creation skipped (set CREATE_DEMO_DB=true to enable)"
     fi
     
     # Restart services
     restart_services
     
-    log "PostgreSQL server initialization completed successfully"
-    log "Connection information saved to connection_info.txt"
+    # Create connection info file
+    create_connection_info
     
-    exit 0
+    log "PostgreSQL server initialization completed successfully"
 }
 
 # Function to set up environment variables
@@ -173,35 +186,137 @@ generate_password() {
     tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16
 }
 
-# Function to create a demo database
+# Function to set up SSL certificates
+setup_ssl() {
+    log "Setting up SSL certificates"
+    
+    # Check if Let's Encrypt is enabled
+    if [ "$USE_LETSENCRYPT" = "true" ]; then
+        log "Setting up Let's Encrypt certificates"
+        
+        # Install certbot and dependencies
+        apt-get update
+        apt-get install -y certbot python3-certbot-nginx
+        
+        # Check if we need a wildcard certificate
+        if [[ "$DOMAIN" == *"*"* ]]; then
+            log "Wildcard domain detected: $DOMAIN"
+            log "Obtaining Let's Encrypt certificate for $DOMAIN"
+            
+            # For wildcard certificates, we need to use DNS validation
+            if command_exists certbot && certbot plugins | grep -q dns-cloudflare; then
+                log "Using Cloudflare DNS validation for wildcard certificate"
+                certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.cloudflare/credentials.ini -d "$DOMAIN" -d "${DOMAIN#\*.}"
+            elif command_exists certbot && certbot plugins | grep -q dns-digitalocean; then
+                log "Using DigitalOcean DNS validation for wildcard certificate"
+                certbot certonly --dns-digitalocean --dns-digitalocean-credentials /root/.digitalocean/credentials.ini -d "$DOMAIN" -d "${DOMAIN#\*.}"
+            else
+                log "WARNING: Wildcard certificates require DNS validation"
+                log "Please install a DNS plugin for certbot and configure it"
+                log "Example: apt-get install python3-certbot-dns-cloudflare"
+                log "Falling back to non-wildcard certificate"
+                
+                # Fall back to a non-wildcard certificate
+                DOMAIN="${DOMAIN#\*.}"
+                certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL_RECIPIENT"
+            fi
+        else
+            log "Obtaining Let's Encrypt certificate for $DOMAIN"
+            certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL_RECIPIENT"
+        fi
+        
+        # Check if certificate was obtained successfully
+        if [ -d "/etc/letsencrypt/live/$DOMAIN" ] || [ -d "/etc/letsencrypt/live/${DOMAIN#\*.}" ]; then
+            log "Let's Encrypt certificates installed successfully"
+            
+            # Set permissions for PostgreSQL to read the certificates
+            CERT_DIR="/etc/letsencrypt/live/${DOMAIN#\*.}"
+            if [ -d "$CERT_DIR" ]; then
+                chmod 750 "$CERT_DIR"
+                chmod 640 "$CERT_DIR/privkey.pem"
+                chown root:postgres "$CERT_DIR/privkey.pem"
+                
+                # Update PostgreSQL configuration to use Let's Encrypt certificates
+                PG_CONF_FILE="/etc/postgresql/$PG_VERSION/main/postgresql.conf"
+                if [ -f "$PG_CONF_FILE" ]; then
+                    sed -i "s|#\?ssl_cert_file\s*=\s*.*|ssl_cert_file = '$CERT_DIR/fullchain.pem'|" "$PG_CONF_FILE"
+                    sed -i "s|#\?ssl_key_file\s*=\s*.*|ssl_key_file = '$CERT_DIR/privkey.pem'|" "$PG_CONF_FILE"
+                    log "PostgreSQL configured to use Let's Encrypt certificates"
+                fi
+            else
+                log "WARNING: Let's Encrypt certificate directory not found"
+            fi
+        else
+            log "WARNING: Let's Encrypt certificate installation failed"
+            log "Generating self-signed certificate as fallback"
+            generate_self_signed_cert
+        fi
+    else
+        log "Using self-signed certificates"
+        generate_self_signed_cert
+    fi
+}
+
+# Function to generate a self-signed certificate
+generate_self_signed_cert() {
+    log "Generating self-signed SSL certificate"
+    
+    # Create directory for certificates
+    CERT_DIR="/etc/ssl/postgresql"
+    mkdir -p "$CERT_DIR"
+    
+    # Generate self-signed certificate
+    openssl req -new -x509 -days "$SSL_CERT_DAYS" -nodes \
+        -out "$CERT_DIR/server.crt" \
+        -keyout "$CERT_DIR/server.key" \
+        -subj "/C=$SSL_COUNTRY/ST=$SSL_STATE/L=$SSL_LOCALITY/O=$SSL_ORGANIZATION/CN=$DOMAIN"
+    
+    # Set permissions
+    chmod 640 "$CERT_DIR/server.key"
+    chmod 644 "$CERT_DIR/server.crt"
+    chown postgres:postgres "$CERT_DIR/server.key"
+    
+    # Update PostgreSQL configuration
+    PG_CONF_FILE="/etc/postgresql/$PG_VERSION/main/postgresql.conf"
+    if [ -f "$PG_CONF_FILE" ]; then
+        sed -i "s|#\?ssl_cert_file\s*=\s*.*|ssl_cert_file = '$CERT_DIR/server.crt'|" "$PG_CONF_FILE"
+        sed -i "s|#\?ssl_key_file\s*=\s*.*|ssl_key_file = '$CERT_DIR/server.key'|" "$PG_CONF_FILE"
+        log "PostgreSQL configured to use self-signed certificate"
+    fi
+}
+
+# Function to create a demo database and user
 create_demo_database() {
     log "Creating demo database and user"
     
     # Check if PostgreSQL is running
-    if systemctl is-active postgresql > /dev/null 2>&1; then
-        # Set demo database name and user
-        DEMO_DB_NAME=${DEMO_DB_NAME:-"demo"}
-        DEMO_DB_USER=${DEMO_DB_USER:-"demo_user"}
-        DEMO_DB_PASSWORD=${DEMO_DB_PASSWORD:-$(generate_password)}
-        
+    if pg_isready -q; then
         # Create demo database and user
-        sudo -u postgres psql -c "CREATE DATABASE $DEMO_DB_NAME;"
-        sudo -u postgres psql -c "CREATE USER $DEMO_DB_USER WITH ENCRYPTED PASSWORD '$DEMO_DB_PASSWORD';"
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DEMO_DB_NAME TO $DEMO_DB_USER;"
-        
-        # Update .env file with demo database information
-        if ! grep -q "DEMO_DB_NAME" "$ENV_FILE"; then
-            echo "" >> "$ENV_FILE"
-            echo "# Demo Database Configuration" >> "$ENV_FILE"
-            echo "DEMO_DB_NAME=$DEMO_DB_NAME" >> "$ENV_FILE"
-            echo "DEMO_DB_USER=$DEMO_DB_USER" >> "$ENV_FILE"
-            echo "DEMO_DB_PASSWORD=$DEMO_DB_PASSWORD" >> "$ENV_FILE"
-        fi
+        create_restricted_user "$DEMO_DB_NAME" "$DEMO_DB_USER" "$DEMO_DB_PASSWORD"
         
         log "Demo database created: $DEMO_DB_NAME"
         log "Demo user created: $DEMO_DB_USER"
     else
         log "WARNING: PostgreSQL is not running, skipping demo database creation"
+        
+        # Try to start PostgreSQL
+        log "Attempting to start PostgreSQL"
+        if pg_lsclusters | grep -q "$PG_VERSION main"; then
+            pg_ctlcluster $PG_VERSION main start
+            sleep 5
+            
+            if pg_isready -q; then
+                log "PostgreSQL started, creating demo database"
+                create_restricted_user "$DEMO_DB_NAME" "$DEMO_DB_USER" "$DEMO_DB_PASSWORD"
+                
+                log "Demo database created: $DEMO_DB_NAME"
+                log "Demo user created: $DEMO_DB_USER"
+            else
+                log "ERROR: Failed to start PostgreSQL, demo database not created"
+            fi
+        else
+            log "ERROR: No PostgreSQL cluster found, demo database not created"
+        fi
     fi
 }
 
@@ -209,12 +324,21 @@ create_demo_database() {
 restart_services() {
     log "Restarting services"
     
-    # Restart PostgreSQL if it's running
-    if systemctl is-active postgresql > /dev/null 2>&1; then
-        log "Restarting PostgreSQL"
-        systemctl restart postgresql
+    # Restart PostgreSQL
+    log "Restarting PostgreSQL"
+    if pg_lsclusters | grep -q "$PG_VERSION main"; then
+        pg_ctlcluster $PG_VERSION main restart
     else
-        log "WARNING: PostgreSQL is not running, skipping restart"
+        if systemctl list-units --state=active | grep -q "postgresql@.*\.service"; then
+            local pg_services=$(systemctl list-units --state=active | grep "postgresql@.*\.service" | awk '{print $1}')
+            while read -r service; do
+                log "Restarting PostgreSQL service $service"
+                systemctl restart "$service"
+            done <<< "$pg_services"
+        else
+            log "Attempting to restart postgresql service"
+            systemctl restart postgresql || log "WARNING: Failed to restart PostgreSQL"
+        fi
     fi
     
     # Restart PgBouncer if it's running
@@ -222,7 +346,8 @@ restart_services() {
         log "Restarting PgBouncer"
         systemctl restart pgbouncer
     else
-        log "WARNING: PgBouncer is not running, skipping restart"
+        log "Starting PgBouncer"
+        systemctl start pgbouncer || log "WARNING: Failed to start PgBouncer"
     fi
     
     # Restart Nginx if it's running
@@ -230,8 +355,81 @@ restart_services() {
         log "Restarting Nginx"
         systemctl restart nginx
     else
-        log "WARNING: Nginx is not running, skipping restart"
+        if [ "$ENABLE_SUBDOMAIN_ROUTING" = "true" ]; then
+            log "Starting Nginx"
+            systemctl start nginx || log "WARNING: Failed to start Nginx"
+        else
+            log "Nginx not needed, skipping restart"
+        fi
     fi
+    
+    # Verify PostgreSQL is running
+    if pg_isready -q; then
+        log "PostgreSQL is running"
+    else
+        log "WARNING: PostgreSQL may not be running after restart"
+        log "Current PostgreSQL cluster status:"
+        pg_lsclusters
+    fi
+}
+
+# Function to create connection info file
+create_connection_info() {
+    log "Creating connection information file"
+    
+    # Create connection info file
+    CONNECTION_INFO_FILE="connection_info.txt"
+    cat > "$CONNECTION_INFO_FILE" << EOF
+PostgreSQL Server Connection Information
+=======================================
+
+PostgreSQL Version: $PG_VERSION
+Host: $(hostname -f)
+Port: 5432
+SSL: $([ "$ENABLE_SSL" = "true" ] && echo "Enabled" || echo "Disabled")
+
+Admin Connection:
+----------------
+Username: postgres
+Password: $PG_PASSWORD
+Connection String: postgresql://postgres:$PG_PASSWORD@$(hostname -f):5432/postgres
+
+PgBouncer Connection:
+-------------------
+Port: 6432
+Connection String: postgresql://postgres:$PG_PASSWORD@$(hostname -f):6432/postgres
+
+$(if [ "$CREATE_DEMO_DB" = "true" ]; then
+echo "Demo Database:
+-------------
+Database: $DEMO_DB_NAME
+Username: $DEMO_DB_USER
+Password: $DEMO_DB_PASSWORD
+Connection String: postgresql://$DEMO_DB_USER:$DEMO_DB_PASSWORD@$(hostname -f):5432/$DEMO_DB_NAME
+PgBouncer Connection String: postgresql://$DEMO_DB_USER:$DEMO_DB_PASSWORD@$(hostname -f):6432/$DEMO_DB_NAME"
+fi)
+
+$(if [ "$ENABLE_SUBDOMAIN_ROUTING" = "true" ]; then
+echo "Subdomain Routing:
+-----------------
+Domain Suffix: $DOMAIN_SUFFIX
+Demo Database URL: $DEMO_DB_NAME.$DOMAIN_SUFFIX"
+fi)
+
+Monitoring:
+----------
+Prometheus: http://$(hostname -f):9090
+Grafana: http://$(hostname -f):3000 (admin/admin)
+Node Exporter: http://$(hostname -f):9100
+PostgreSQL Exporter: http://$(hostname -f):9187
+
+Generated: $(date +'%Y-%m-%d %H:%M:%S')
+EOF
+    
+    # Set permissions
+    chmod 600 "$CONNECTION_INFO_FILE"
+    
+    log "Connection information saved to $CONNECTION_INFO_FILE"
 }
 
 # Call the main function

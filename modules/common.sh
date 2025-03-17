@@ -50,17 +50,73 @@ install_package() {
 
 # Function to check if a service is running
 service_running() {
-    systemctl is-active "$1" >/dev/null 2>&1
+    local service_name="$1"
+    
+    # Special handling for PostgreSQL
+    if [[ "$service_name" == "postgresql" ]]; then
+        # First try pg_isready if available
+        if command_exists pg_isready; then
+            if pg_isready -q; then
+                return 0
+            fi
+        fi
+        
+        # Check for specific PostgreSQL service patterns
+        if systemctl list-units --state=active | grep -q "postgresql@.*\.service"; then
+            return 0
+        fi
+    fi
+    
+    # Standard check for other services
+    systemctl is-active "$service_name" >/dev/null 2>&1
 }
 
 # Function to restart a service if it's running
 restart_service() {
-    if service_running "$1"; then
-        log "Restarting service: $1"
-        systemctl restart "$1"
+    local service_name="$1"
+    
+    # Special handling for PostgreSQL
+    if [[ "$service_name" == "postgresql" ]]; then
+        log "Restarting PostgreSQL"
+        
+        # Try to use pg_ctlcluster if available
+        if command_exists pg_ctlcluster && command_exists pg_lsclusters; then
+            # Get the list of running clusters
+            local clusters=$(pg_lsclusters | grep -v "down" | awk '{print $1" "$2}')
+            
+            if [ -n "$clusters" ]; then
+                log "Restarting PostgreSQL clusters"
+                while read -r version cluster; do
+                    log "Restarting PostgreSQL cluster $version $cluster"
+                    pg_ctlcluster "$version" "$cluster" restart
+                done <<< "$clusters"
+                return 0
+            fi
+        fi
+        
+        # If pg_ctlcluster failed or no clusters found, try systemctl
+        if systemctl list-units --state=active | grep -q "postgresql@.*\.service"; then
+            local pg_services=$(systemctl list-units --state=active | grep "postgresql@.*\.service" | awk '{print $1}')
+            while read -r service; do
+                log "Restarting PostgreSQL service $service"
+                systemctl restart "$service"
+            done <<< "$pg_services"
+            return 0
+        fi
+        
+        # Fallback to generic service
+        log "Using generic PostgreSQL service"
+        systemctl restart postgresql
+        return 0
+    fi
+    
+    # Standard restart for other services
+    if systemctl is-active "$service_name" >/dev/null 2>&1; then
+        log "Restarting service: $service_name"
+        systemctl restart "$service_name"
     else
-        log "Starting service: $1"
-        systemctl start "$1"
+        log "Starting service: $service_name"
+        systemctl start "$service_name"
     fi
 }
 
@@ -81,11 +137,10 @@ create_directory() {
 # Function to backup a file
 backup_file() {
     local file="$1"
-    local backup="${file}.$(date +'%Y%m%d%H%M%S').bak"
-    
     if [ -f "$file" ]; then
-        log "Backing up file: $file to $backup"
-        cp "$file" "$backup"
+        local backup_file="${file}.$(date +'%Y%m%d%H%M%S').bak"
+        log "Backing up file: $file to $backup_file"
+        cp "$file" "$backup_file"
     fi
 }
 
@@ -124,4 +179,33 @@ EOF
     else
         log "Email configuration not complete, skipping email notification"
     fi
+}
+
+# Function to setup environment variables
+setup_environment() {
+    log "Setting up environment variables"
+    
+    # Check for .env file
+    ENV_FILE="./.env"
+    if [ -f "$ENV_FILE" ]; then
+        log "Loading environment variables from $ENV_FILE"
+        set -a
+        source "$ENV_FILE"
+        set +a
+    else
+        log "ERROR: Environment file $ENV_FILE not found"
+        log "Please create an environment file based on .env.example"
+        exit 1
+    fi
+    
+    # Backup environment file
+    ENV_BACKUP_DIR="./.env_backups"
+    mkdir -p "$ENV_BACKUP_DIR"
+    ENV_BACKUP_FILE="$ENV_BACKUP_DIR/.env.$(date +'%Y%m%d%H%M%S')"
+    log "Backing up environment file"
+    cp "$ENV_FILE" "$ENV_BACKUP_FILE"
+    
+    # Set permissions on environment files
+    chmod 600 "$ENV_FILE"
+    chmod 600 "$ENV_BACKUP_FILE"
 } 
