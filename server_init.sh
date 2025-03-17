@@ -211,14 +211,11 @@ setup_ssl() {
                 log "Using DigitalOcean DNS validation for wildcard certificate"
                 certbot certonly --dns-digitalocean --dns-digitalocean-credentials /root/.digitalocean/credentials.ini -d "$DOMAIN" -d "${DOMAIN#\*.}"
             else
-                log "WARNING: Wildcard certificates require DNS validation"
+                log "ERROR: Wildcard certificates require DNS validation"
                 log "Please install a DNS plugin for certbot and configure it"
                 log "Example: apt-get install python3-certbot-dns-cloudflare"
-                log "Falling back to non-wildcard certificate"
-                
-                # Fall back to a non-wildcard certificate
-                DOMAIN="${DOMAIN#\*.}"
-                certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL_RECIPIENT"
+                log "Certificate setup failed - cannot proceed with wildcard certificate"
+                return 1
             fi
         else
             log "Obtaining Let's Encrypt certificate for $DOMAIN"
@@ -244,44 +241,20 @@ setup_ssl() {
                     log "PostgreSQL configured to use Let's Encrypt certificates"
                 fi
             else
-                log "WARNING: Let's Encrypt certificate directory not found"
+                log "ERROR: Let's Encrypt certificate directory not found"
+                log "Certificate setup failed - cannot proceed with SSL"
+                return 1
             fi
         else
-            log "WARNING: Let's Encrypt certificate installation failed"
-            log "Generating self-signed certificate as fallback"
-            generate_self_signed_cert
+            log "ERROR: Let's Encrypt certificate installation failed"
+            log "Certificate setup failed - cannot proceed with SSL"
+            return 1
         fi
     else
-        log "Using self-signed certificates"
-        generate_self_signed_cert
-    fi
-}
-
-# Function to generate a self-signed certificate
-generate_self_signed_cert() {
-    log "Generating self-signed SSL certificate"
-    
-    # Create directory for certificates
-    CERT_DIR="/etc/ssl/postgresql"
-    mkdir -p "$CERT_DIR"
-    
-    # Generate self-signed certificate
-    openssl req -new -x509 -days "$SSL_CERT_DAYS" -nodes \
-        -out "$CERT_DIR/server.crt" \
-        -keyout "$CERT_DIR/server.key" \
-        -subj "/C=$SSL_COUNTRY/ST=$SSL_STATE/L=$SSL_LOCALITY/O=$SSL_ORGANIZATION/CN=$DOMAIN"
-    
-    # Set permissions
-    chmod 640 "$CERT_DIR/server.key"
-    chmod 644 "$CERT_DIR/server.crt"
-    chown postgres:postgres "$CERT_DIR/server.key"
-    
-    # Update PostgreSQL configuration
-    PG_CONF_FILE="/etc/postgresql/$PG_VERSION/main/postgresql.conf"
-    if [ -f "$PG_CONF_FILE" ]; then
-        sed -i "s|#\?ssl_cert_file\s*=\s*.*|ssl_cert_file = '$CERT_DIR/server.crt'|" "$PG_CONF_FILE"
-        sed -i "s|#\?ssl_key_file\s*=\s*.*|ssl_key_file = '$CERT_DIR/server.key'|" "$PG_CONF_FILE"
-        log "PostgreSQL configured to use self-signed certificate"
+        log "ERROR: SSL is enabled but Let's Encrypt is disabled"
+        log "For security reasons, self-signed certificates are not supported"
+        log "Please set USE_LETSENCRYPT=true or disable SSL with ENABLE_SSL=false"
+        return 1
     fi
 }
 

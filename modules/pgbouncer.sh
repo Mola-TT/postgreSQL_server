@@ -64,22 +64,45 @@ EOF
     
     # Check if PostgreSQL is running before generating password
     if pg_isready -q; then
-        # Generate MD5 hash for PgBouncer
-        PG_MD5_PASSWORD=$(echo -n "$PG_PASSWORD$postgres" | md5sum | cut -d ' ' -f 1)
-        echo "\"postgres\" \"md5$PG_MD5_PASSWORD\"" > "$PGB_USERS_FILE"
+        # Use PostgreSQL's built-in password encryption for PgBouncer
+        log "Using PostgreSQL's password encryption for PgBouncer"
         
-        # If demo database is enabled, add demo user to PgBouncer
-        if [ "$CREATE_DEMO_DB" = "true" ]; then
-            DEMO_MD5_PASSWORD=$(echo -n "$DEMO_DB_PASSWORD$DEMO_DB_USER" | md5sum | cut -d ' ' -f 1)
-            echo "\"$DEMO_DB_USER\" \"md5$DEMO_MD5_PASSWORD\"" >> "$PGB_USERS_FILE"
+        # Create temporary SQL file for secure password generation
+        TMP_SQL=$(mktemp)
+        cat > "$TMP_SQL" << EOF
+SELECT 'postgres' AS username, concat('md5', md5('$PG_PASSWORD' || 'postgres')) AS password;
+EOF
+        
+        if [ "$CREATE_DEMO_DB" = "true" ] && [ -n "$DEMO_DB_USER" ] && [ -n "$DEMO_DB_PASSWORD" ]; then
+            cat >> "$TMP_SQL" << EOF
+SELECT '$DEMO_DB_USER' AS username, concat('md5', md5('$DEMO_DB_PASSWORD' || '$DEMO_DB_USER')) AS password;
+EOF
         fi
-    else
-        # PostgreSQL is not running, create a basic userlist file
-        log "PostgreSQL is not running, creating basic userlist file"
-        echo "\"postgres\" \"md5$(echo -n "${PG_PASSWORD}postgres" | md5sum | cut -d ' ' -f 1)\"" > "$PGB_USERS_FILE"
         
-        # Create a script to update the userlist file later
-        create_pgbouncer_update_script
+        # Generate userlist using PostgreSQL
+        sudo -u postgres psql -t -f "$TMP_SQL" | while read -r username password; do
+            # Clean up username and password
+            username=$(echo "$username" | tr -d ' ')
+            password=$(echo "$password" | tr -d ' ')
+            
+            # Add to userlist file
+            echo "\"$username\" \"$password\"" >> "$PGB_USERS_FILE.new"
+        done
+        
+        # Check if new userlist file was created successfully
+        if [ -s "$PGB_USERS_FILE.new" ]; then
+            mv "$PGB_USERS_FILE.new" "$PGB_USERS_FILE"
+        else
+            log "ERROR: Failed to generate PgBouncer userlist"
+            # Fallback to basic method if PostgreSQL method fails
+            generate_pgbouncer_userlist_basic
+        fi
+        
+        # Clean up
+        rm -f "$TMP_SQL"
+    else
+        log "PostgreSQL is not running, using basic password encryption method"
+        generate_pgbouncer_userlist_basic
     fi
     
     # Set permissions for PgBouncer files
@@ -128,6 +151,21 @@ EOF
     restart_service "pgbouncer"
 }
 
+# Function to generate basic PgBouncer userlist
+generate_pgbouncer_userlist_basic() {
+    log "Generating basic PgBouncer userlist"
+    
+    # Generate MD5 hash for postgres user
+    local postgres_md5=$(echo -n "$PG_PASSWORD$postgres" | md5sum | cut -d ' ' -f 1)
+    echo "\"postgres\" \"md5$postgres_md5\"" > "$PGB_USERS_FILE"
+    
+    # Add demo user if enabled
+    if [ "$CREATE_DEMO_DB" = "true" ] && [ -n "$DEMO_DB_USER" ] && [ -n "$DEMO_DB_PASSWORD" ]; then
+        local demo_md5=$(echo -n "$DEMO_DB_PASSWORD$DEMO_DB_USER" | md5sum | cut -d ' ' -f 1)
+        echo "\"$DEMO_DB_USER\" \"md5$demo_md5\"" >> "$PGB_USERS_FILE"
+    fi
+}
+
 # Function to create PgBouncer update script
 create_pgbouncer_update_script() {
     log "Creating PgBouncer update script"
@@ -157,9 +195,22 @@ fi
 # Create temporary file
 TEMP_FILE=$(mktemp)
 
-# Get list of PostgreSQL users and their passwords
+# Get list of PostgreSQL users and their passwords using a more secure method
 log "Retrieving PostgreSQL users"
-sudo -u postgres psql -t -c "SELECT usename, passwd FROM pg_shadow" | while read -r user password; do
+
+# Create temporary SQL file
+TMP_SQL=$(mktemp)
+cat > "$TMP_SQL" << EOSQL
+SELECT usename, 
+       CASE WHEN substr(passwd, 1, 3) = 'md5' 
+            THEN passwd 
+            ELSE concat('md5', md5(passwd || usename)) 
+       END AS password
+FROM pg_shadow;
+EOSQL
+
+# Execute SQL and process results
+sudo -u postgres psql -t -f "$TMP_SQL" | while read -r user password; do
     # Clean up user and password
     user=$(echo "$user" | tr -d ' ')
     password=$(echo "$password" | tr -d ' ')
@@ -172,6 +223,9 @@ sudo -u postgres psql -t -c "SELECT usename, passwd FROM pg_shadow" | while read
     # Add user to temporary file
     echo "\"$user\" \"$password\"" >> "$TEMP_FILE"
 done
+
+# Clean up
+rm -f "$TMP_SQL"
 
 # Check if temporary file was created successfully
 if [ ! -s "$TEMP_FILE" ]; then
@@ -221,16 +275,31 @@ add_pgbouncer_user() {
         chmod 640 "$PGB_USERS_FILE"
     fi
     
-    # Generate MD5 hash for PgBouncer
-    local md5_password=$(echo -n "$password$username" | md5sum | cut -d ' ' -f 1)
-    
-    # Check if user already exists in userlist
-    if grep -q "\"$username\"" "$PGB_USERS_FILE"; then
-        # Update existing user
-        sed -i "s/\"$username\".*$/\"$username\" \"md5$md5_password\"/" "$PGB_USERS_FILE"
+    # Use PostgreSQL to generate secure password hash if available
+    if pg_isready -q; then
+        local secure_password=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('$password' || '$username'))")
+        secure_password=$(echo "$secure_password" | tr -d ' ')
+        
+        # Check if user already exists in userlist
+        if grep -q "\"$username\"" "$PGB_USERS_FILE"; then
+            # Update existing user
+            sed -i "s/\"$username\".*$/\"$username\" \"$secure_password\"/" "$PGB_USERS_FILE"
+        else
+            # Add new user
+            echo "\"$username\" \"$secure_password\"" >> "$PGB_USERS_FILE"
+        fi
     else
-        # Add new user
-        echo "\"$username\" \"md5$md5_password\"" >> "$PGB_USERS_FILE"
+        # Fallback to basic method if PostgreSQL is not available
+        local md5_password=$(echo -n "$password$username" | md5sum | cut -d ' ' -f 1)
+        
+        # Check if user already exists in userlist
+        if grep -q "\"$username\"" "$PGB_USERS_FILE"; then
+            # Update existing user
+            sed -i "s/\"$username\".*$/\"$username\" \"md5$md5_password\"/" "$PGB_USERS_FILE"
+        else
+            # Add new user
+            echo "\"$username\" \"md5$md5_password\"" >> "$PGB_USERS_FILE"
+        fi
     fi
     
     # Reload PgBouncer if it's running
