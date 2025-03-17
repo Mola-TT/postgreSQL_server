@@ -719,6 +719,56 @@ fix_postgresql_cluster() {
     fi
 }
 
+# Function to reset demo user password
+reset_demo_password() {
+    log "Resetting password for demo user"
+    
+    # Generate a new password
+    NEW_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
+    
+    # Check if PostgreSQL is running
+    if ! sudo -u postgres pg_isready -q; then
+        log "PostgreSQL is not running. Starting PostgreSQL..."
+        systemctl start postgresql
+        sleep 5
+        
+        if ! sudo -u postgres pg_isready -q; then
+            log "ERROR: PostgreSQL is not running. Cannot reset password."
+            return 1
+        fi
+    fi
+    
+    # Reset the password
+    sudo -u postgres psql -c "ALTER USER demo WITH PASSWORD '$NEW_PASSWORD';"
+    
+    # Display the new password
+    log "Demo user password has been reset"
+    log "Demo username: demo"
+    log "Demo password: $NEW_PASSWORD"
+    
+    # Update connection info file
+    if [ -f "/etc/dbhub/connection_info.txt" ]; then
+        log "Updating connection info file"
+        sed -i "s/Demo Password:.*/Demo Password: $NEW_PASSWORD/" /etc/dbhub/connection_info.txt
+    fi
+    
+    # Update PgBouncer userlist
+    if [ -f "/etc/pgbouncer/userlist.txt" ]; then
+        log "Updating PgBouncer userlist"
+        # Get the encrypted password for PgBouncer
+        ENCRYPTED_PASS=$(sudo -u postgres psql -t -c "SELECT concat('\"', usename, '\" \"', passwd, '\"') FROM pg_shadow WHERE usename='demo';" | grep -v "^$" | sed -e 's/^[ \t]*//')
+        
+        # Update the userlist file
+        sed -i "/^\"demo\"/d" /etc/pgbouncer/userlist.txt
+        echo "$ENCRYPTED_PASS" >> /etc/pgbouncer/userlist.txt
+        
+        # Restart PgBouncer
+        systemctl restart pgbouncer
+    fi
+    
+    return 0
+}
+
 # Main function
 main() {
     log "Starting server initialization"
@@ -835,6 +885,7 @@ usage() {
     echo "Usage:"
     echo "  $0 install                - Install and configure PostgreSQL and PgBouncer"
     echo "  $0 diagnostics            - Run diagnostics on PostgreSQL installation"
+    echo "  $0 reset-password         - Reset the demo user password"
     echo "  $0 help                   - Display this help message"
 }
 
@@ -845,6 +896,9 @@ case "$1" in
         ;;
     diagnostics)
         run_diagnostics
+        ;;
+    reset-password)
+        reset_demo_password
         ;;
     help|--help|-h)
         usage
