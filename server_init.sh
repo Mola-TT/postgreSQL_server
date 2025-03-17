@@ -765,6 +765,108 @@ fix_postgresql_cluster() {
     fi
 }
 
+# Function to send email
+send_email() {
+    local subject="$1"
+    local message="$2"
+    
+    # Add [DBHub] prefix to subject if not already present
+    if [[ ! "$subject" == \[DBHub\]* ]]; then
+        subject="[DBHub] $subject"
+    fi
+    
+    if [ -n "$EMAIL_RECIPIENT" ] && [ -n "$EMAIL_SENDER" ] && [ -n "$SMTP_SERVER" ] && [ -n "$SMTP_PORT" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASS" ]; then
+        log "Sending email to $EMAIL_RECIPIENT: $subject"
+        
+        # Create email content
+        local email_content="From: $EMAIL_SENDER
+To: $EMAIL_RECIPIENT
+Subject: $subject
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+$message
+
+--
+This is an automated message from your DBHub.cc server.
+Time: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
+"
+        
+        # Send email using curl with SSL
+        if curl --silent --show-error --url "smtps://$SMTP_SERVER:$SMTP_PORT" \
+             --ssl-reqd \
+             --mail-from "$EMAIL_SENDER" \
+             --mail-rcpt "$EMAIL_RECIPIENT" \
+             --user "$SMTP_USER:$SMTP_PASS" \
+             --upload-file - <<< "$email_content"; then
+            log "Email sent successfully to $EMAIL_RECIPIENT"
+            return 0
+        else
+            log "Failed to send email to $EMAIL_RECIPIENT"
+            return 1
+        fi
+    else
+        log "Email configuration not complete, skipping email notification"
+        log "Please set EMAIL_RECIPIENT, EMAIL_SENDER, SMTP_SERVER, SMTP_PORT, SMTP_USER, and SMTP_PASS in your .env file"
+        return 1
+    fi
+}
+
+# Function to send completion notification
+send_completion_notification() {
+    log "Sending completion notification email"
+    
+    # Get server IP
+    local server_ip=$(curl -s ifconfig.me || hostname -I | awk '{print $1}')
+    
+    # Create message
+    local message="
+PostgreSQL Server Setup Complete!
+
+Your PostgreSQL server has been successfully set up and configured.
+
+Server Information:
+------------------
+PostgreSQL Version: $PG_VERSION
+Host: $(hostname -f)
+IP Address: $server_ip
+PostgreSQL Port: 5432
+PgBouncer Port: 6432
+Remote Access: $([ "$ENABLE_REMOTE_ACCESS" = true ] && echo "Enabled" || echo "Disabled")
+
+Admin Connection:
+----------------
+Username: postgres
+Password: $PG_PASSWORD
+
+Demo Database:
+-------------
+Database: ${DEMO_DB_NAME:-demo}
+Username: ${DEMO_DB_USER:-demo}
+Password: ${DEMO_DB_PASSWORD:-demo}
+
+Connection Strings:
+-----------------
+Local PostgreSQL: postgresql://postgres:$PG_PASSWORD@localhost:5432/postgres
+Local PgBouncer: postgresql://postgres:$PG_PASSWORD@localhost:6432/postgres
+External PostgreSQL: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@$server_ip:5432/${DEMO_DB_NAME:-demo}
+External PgBouncer: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@$server_ip:6432/${DEMO_DB_NAME:-demo}
+
+Configuration Files:
+------------------
+PostgreSQL Config: /etc/postgresql/$PG_VERSION/main/postgresql.conf
+PgBouncer Config: /etc/pgbouncer/pgbouncer.ini
+Environment File: /etc/dbhub/.env
+Log Directory: $LOG_DIR
+
+Setup completed at: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
+"
+    
+    # Send email
+    send_email "PostgreSQL Server Setup Complete" "$message"
+}
+
 # Main function
 main() {
     log "Starting server initialization"
@@ -893,6 +995,9 @@ EOF
     log "Demo Database: ${DEMO_DB_NAME:-demo}"
     log "Demo Username: ${DEMO_DB_USER:-demo}"
     log "Demo Password: ${DEMO_DB_PASSWORD:-demo}"
+    
+    # Send completion notification email
+    send_completion_notification
 }
 
 # Display usage information
