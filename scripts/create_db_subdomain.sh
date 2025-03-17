@@ -25,7 +25,7 @@ fi
 
 # Logging function
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(TZ=Asia/Singapore date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
 # Create log file if it doesn't exist
@@ -189,7 +189,7 @@ setup_trigger() {
 LOG_FILE="/var/log/db-subdomain.log"
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(TZ=Asia/Singapore date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
 log "Starting database creation listener"

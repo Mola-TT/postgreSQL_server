@@ -14,7 +14,7 @@ touch $LOG_FILE
 
 # Logging function
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+    echo "[$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
 }
 
 # Check if running as root
@@ -35,11 +35,11 @@ if ! command -v pgbouncer &> /dev/null; then
     exit 1
 fi
 
-# Create backup of existing userlist file
+# Backup existing userlist file
 if [ -f "$PGBOUNCER_USERLIST_FILE" ]; then
-    BACKUP_FILE="${PGBOUNCER_USERLIST_FILE}.$(date +%Y%m%d%H%M%S).bak"
+    BACKUP_FILE="${PGBOUNCER_USERLIST_FILE}.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
     cp "$PGBOUNCER_USERLIST_FILE" "$BACKUP_FILE"
-    log "Created backup of userlist file: $BACKUP_FILE"
+    log "Backed up existing userlist file to $BACKUP_FILE"
 fi
 
 # Generate new userlist file
@@ -49,7 +49,7 @@ log "Generating new PgBouncer userlist file"
 TEMP_USERLIST=$(mktemp)
 
 # Add header
-echo "# PgBouncer userlist file - Generated on $(date)" > "$TEMP_USERLIST"
+echo "# PgBouncer userlist file - Generated on $(TZ=Asia/Singapore date)" > "$TEMP_USERLIST"
 echo "# username password" >> "$TEMP_USERLIST"
 
 # Get users and passwords from PostgreSQL

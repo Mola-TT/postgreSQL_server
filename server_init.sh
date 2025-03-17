@@ -49,7 +49,7 @@ touch "$LOG_FILE"
 
 # Logging function
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
 # Function to check if a command exists
@@ -186,7 +186,7 @@ wait_for_postgresql() {
 # Function to create or load environment file
 setup_env_file() {
     ENV_FILE="/etc/dbhub/.env"
-    ENV_BACKUP_FILE="/etc/dbhub/.env.backup.$(date +%Y%m%d%H%M%S)"
+    ENV_BACKUP_FILE="/etc/dbhub/.env.backup.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S)"
     
     # Create directory if it doesn't exist
     if [ ! -d "/etc/dbhub" ]; then
@@ -772,7 +772,7 @@ Password: $DEMO_PASSWORD
 Connection String: postgresql://demo:$DEMO_PASSWORD@localhost:5432/demo
 PgBouncer Connection String: postgresql://demo:$DEMO_PASSWORD@localhost:6432/demo
 
-Generated: $(date +'%Y-%m-%d %H:%M:%S')
+Generated: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
 EOF
     
     log "Connection information saved to $CONNECTION_INFO_FILE"

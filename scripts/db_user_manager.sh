@@ -11,7 +11,7 @@ touch $LOG_FILE
 
 # Logging function
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+    echo "[$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
 }
 
 # Function to check if a database exists

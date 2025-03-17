@@ -11,7 +11,7 @@ GRAFANA_VERSION="10.0.3"
 
 # Function to log messages
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
 # Create log file if it doesn't exist

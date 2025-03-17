@@ -19,7 +19,7 @@ done
 
 # Logging function
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(TZ=Asia/Singapore date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
 # Create log file if it doesn't exist
@@ -119,9 +119,9 @@ log "max_parallel_workers = $MAX_PARALLEL_WORKERS"
 log "max_parallel_workers_per_gather = $MAX_PARALLEL_WORKERS_PER_GATHER"
 
 # Backup the original configuration file
-BACKUP_FILE="${PG_CONF}.$(date +%Y%m%d%H%M%S).bak"
+BACKUP_FILE="${PG_CONF}.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
 cp "$PG_CONF" "$BACKUP_FILE"
-log "Backed up original configuration to $BACKUP_FILE"
+log "Created backup of PostgreSQL configuration: $BACKUP_FILE"
 
 # Update PostgreSQL configuration
 update_setting() {

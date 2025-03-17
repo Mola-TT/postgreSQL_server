@@ -4,10 +4,10 @@
 # This script creates backups of PostgreSQL databases with rotation and compression
 
 # Configuration
-BACKUP_DIR="/var/backups/postgresql"
+BACKUP_DIR="/var/backups/postgres"
 LOG_FILE="/var/log/dbhub/backup.log"
 RETENTION_DAYS=7  # Number of days to keep backups
-DATE=$(date +%Y-%m-%d_%H-%M-%S)
+DATE=$(TZ=Asia/Singapore date +%Y-%m-%d_%H-%M-%S)
 HOSTNAME=$(hostname)
 
 # Ensure log directory exists
@@ -16,7 +16,7 @@ touch $LOG_FILE
 
 # Logging function
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
+    echo "[$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a $LOG_FILE
 }
 
 # Load environment variables for email configuration
@@ -29,28 +29,32 @@ done
 
 # Alert function
 send_alert() {
-    SUBJECT="$HOSTNAME Alert: $1"
-    MESSAGE="$2"
+    local subject="$1"
+    local message="$2"
+    
+    # Prepare email content
+    local email_content="Subject: [BACKUP ALERT] $subject
+From: $EMAIL_SENDER
+To: $EMAIL_RECIPIENT
+
+$message
+
+Hostname: $HOSTNAME
+Timestamp: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
+"
     
     if [ -n "$EMAIL_RECIPIENT" ] && [ -n "$EMAIL_SENDER" ] && [ -n "$SMTP_SERVER" ] && [ -n "$SMTP_PORT" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASS" ]; then
-        log "Sending email alert: $SUBJECT"
+        log "Sending email alert: $subject"
         curl --ssl-reqd \
             --url "smtps://$SMTP_SERVER:$SMTP_PORT" \
             --user "$SMTP_USER:$SMTP_PASS" \
             --mail-from "$EMAIL_SENDER" \
             --mail-rcpt "$EMAIL_RECIPIENT" \
             --upload-file - << EOF
-From: Database Backup <$EMAIL_SENDER>
-To: Admin <$EMAIL_RECIPIENT>
-Subject: $SUBJECT
-
-$MESSAGE
-
-Timestamp: $(date +'%Y-%m-%d %H:%M:%S')
-Hostname: $HOSTNAME
+$email_content
 EOF
     else
-        log "Email configuration not found. Alert not sent: $SUBJECT"
+        log "Email configuration not found. Alert not sent: $subject"
     fi
 }
 
