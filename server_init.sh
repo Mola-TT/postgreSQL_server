@@ -208,6 +208,12 @@ PG_VERSION=$PG_VERSION
 PG_PASSWORD=$(openssl rand -base64 16)
 PGBOUNCER_PASSWORD=$(openssl rand -base64 16)
 
+# Demo database settings
+CREATE_DEMO_DB=true
+DEMO_DB_NAME=demo
+DEMO_DB_USER=demo
+DEMO_DB_PASSWORD=demo
+
 # Email settings
 EMAIL_RECIPIENT=$EMAIL_RECIPIENT
 EMAIL_SENDER=$EMAIL_SENDER
@@ -470,11 +476,10 @@ configure_firewall() {
     # Allow SSH
     ufw allow ssh
     
-    # Allow PostgreSQL if remote access is enabled
-    if [ "$ENABLE_REMOTE_ACCESS" = true ]; then
-        log "Opening PostgreSQL port in firewall"
-        ufw allow 5432/tcp
-    fi
+    # Allow PostgreSQL ports
+    log "Opening PostgreSQL ports in firewall"
+    ufw allow 5432/tcp
+    ufw allow 6432/tcp
     
     log "Firewall configuration complete"
 }
@@ -515,10 +520,24 @@ create_demo_database() {
     # Wait for PostgreSQL to be ready
     wait_for_postgresql
     
+    # Check if demo database creation is enabled
+    if [ "${CREATE_DEMO_DB}" != "true" ]; then
+        log "Demo database creation is disabled. Skipping."
+        return 0
+    fi
+    
+    # Use values from .env file
+    local db_name="${DEMO_DB_NAME:-demo}"
+    local user_name="${DEMO_DB_USER:-demo}"
+    local password="${DEMO_DB_PASSWORD:-demo}"
+    
+    log "Using demo database name: $db_name"
+    log "Using demo username: $user_name"
+    
     # Create demo database
     log "Creating demo database"
-    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='demo'" | grep -q 1; then
-        sudo -u postgres psql -c "CREATE DATABASE demo;"
+    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='$db_name'" | grep -q 1; then
+        sudo -u postgres psql -c "CREATE DATABASE $db_name;"
         log "Demo database created"
     else
         log "Demo database already exists"
@@ -526,29 +545,28 @@ create_demo_database() {
     
     # Create demo user
     log "Creating demo user"
-    DEMO_PASSWORD=$(openssl rand -base64 12)
-    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='demo'" | grep -q 1; then
-        sudo -u postgres psql -c "CREATE USER demo WITH PASSWORD '$DEMO_PASSWORD';"
+    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" | grep -q 1; then
+        sudo -u postgres psql -c "CREATE USER $user_name WITH PASSWORD '$password';"
         log "Demo user created"
     else
-        sudo -u postgres psql -c "ALTER USER demo WITH PASSWORD '$DEMO_PASSWORD';"
+        sudo -u postgres psql -c "ALTER USER $user_name WITH PASSWORD '$password';"
         log "Demo user password updated"
     fi
     
     # Grant privileges
-    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE demo TO demo;"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
     log "Privileges granted to demo user"
     
     # Add demo user to PgBouncer
     # Get PostgreSQL password hash for demo user
-    DEMO_PASSWORD_HASH=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('${DEMO_PASSWORD}' || 'demo'))")
+    DEMO_PASSWORD_HASH=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('${password}' || '${user_name}'))")
     
     # Add to userlist.txt
-    echo "\"demo\" \"${DEMO_PASSWORD_HASH}\"" >> /etc/pgbouncer/userlist.txt
+    echo "\"$user_name\" \"${DEMO_PASSWORD_HASH}\"" >> /etc/pgbouncer/userlist.txt
     
     log "Demo database and user created"
-    log "Demo username: demo"
-    log "Demo password: $DEMO_PASSWORD"
+    log "Demo username: $user_name"
+    log "Demo password: $password"
 }
 
 # Function to set up monitoring scripts
@@ -719,56 +737,6 @@ fix_postgresql_cluster() {
     fi
 }
 
-# Function to reset demo user password
-reset_demo_password() {
-    log "Resetting password for demo user"
-    
-    # Generate a new password
-    NEW_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9')
-    
-    # Check if PostgreSQL is running
-    if ! sudo -u postgres pg_isready -q; then
-        log "PostgreSQL is not running. Starting PostgreSQL..."
-        systemctl start postgresql
-        sleep 5
-        
-        if ! sudo -u postgres pg_isready -q; then
-            log "ERROR: PostgreSQL is not running. Cannot reset password."
-            return 1
-        fi
-    fi
-    
-    # Reset the password
-    sudo -u postgres psql -c "ALTER USER demo WITH PASSWORD '$NEW_PASSWORD';"
-    
-    # Display the new password
-    log "Demo user password has been reset"
-    log "Demo username: demo"
-    log "Demo password: $NEW_PASSWORD"
-    
-    # Update connection info file
-    if [ -f "/etc/dbhub/connection_info.txt" ]; then
-        log "Updating connection info file"
-        sed -i "s/Demo Password:.*/Demo Password: $NEW_PASSWORD/" /etc/dbhub/connection_info.txt
-    fi
-    
-    # Update PgBouncer userlist
-    if [ -f "/etc/pgbouncer/userlist.txt" ]; then
-        log "Updating PgBouncer userlist"
-        # Get the encrypted password for PgBouncer
-        ENCRYPTED_PASS=$(sudo -u postgres psql -t -c "SELECT concat('\"', usename, '\" \"', passwd, '\"') FROM pg_shadow WHERE usename='demo';" | grep -v "^$" | sed -e 's/^[ \t]*//')
-        
-        # Update the userlist file
-        sed -i "/^\"demo\"/d" /etc/pgbouncer/userlist.txt
-        echo "$ENCRYPTED_PASS" >> /etc/pgbouncer/userlist.txt
-        
-        # Restart PgBouncer
-        systemctl restart pgbouncer
-    fi
-    
-    return 0
-}
-
 # Main function
 main() {
     log "Starting server initialization"
@@ -800,6 +768,9 @@ main() {
     
     # Configure PgBouncer
     configure_pgbouncer
+    
+    # Configure firewall
+    configure_firewall
     
     # Create demo database
     create_demo_database
@@ -867,11 +838,11 @@ Connection String: postgresql://postgres:$PG_PASSWORD@localhost:6432/postgres
 
 Demo Database:
 -------------
-Database: demo
-Username: demo
-Password: $DEMO_PASSWORD
-Connection String: postgresql://demo:$DEMO_PASSWORD@localhost:5432/demo
-PgBouncer Connection String: postgresql://demo:$DEMO_PASSWORD@localhost:6432/demo
+Database: ${DEMO_DB_NAME:-demo}
+Username: ${DEMO_DB_USER:-demo}
+Password: ${DEMO_DB_PASSWORD:-demo}
+Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@localhost:5432/${DEMO_DB_NAME:-demo}
+PgBouncer Connection String: postgresql://${DEMO_DB_USER:-demo}:${DEMO_DB_PASSWORD:-demo}@localhost:6432/${DEMO_DB_NAME:-demo}
 
 Generated: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
 EOF
@@ -885,7 +856,6 @@ usage() {
     echo "Usage:"
     echo "  $0 install                - Install and configure PostgreSQL and PgBouncer"
     echo "  $0 diagnostics            - Run diagnostics on PostgreSQL installation"
-    echo "  $0 reset-password         - Reset the demo user password"
     echo "  $0 help                   - Display this help message"
 }
 
@@ -896,9 +866,6 @@ case "$1" in
         ;;
     diagnostics)
         run_diagnostics
-        ;;
-    reset-password)
-        reset_demo_password
         ;;
     help|--help|-h)
         usage
