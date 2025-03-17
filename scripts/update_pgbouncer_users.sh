@@ -53,14 +53,11 @@ echo "# PgBouncer userlist file - Generated on $(date)" > "$TEMP_USERLIST"
 echo "# username password" >> "$TEMP_USERLIST"
 
 # Get users and passwords from PostgreSQL
-sudo -u postgres psql -t -c "SELECT usename, passwd FROM pg_shadow WHERE passwd IS NOT NULL" | while read -r user password; do
-    # Remove leading/trailing whitespace
-    user=$(echo "$user" | xargs)
-    password=$(echo "$password" | xargs)
-    
-    if [ -n "$user" ] && [ -n "$password" ]; then
-        echo "\"$user\" \"$password\"" >> "$TEMP_USERLIST"
-        log "Added user: $user"
+sudo -u postgres psql -t -c "SELECT usename, concat('\"', usename, '\" \"', concat('md5', md5(passwd || usename)), '\"') FROM pg_shadow WHERE passwd IS NOT NULL" | while read -r line; do
+    if [ -n "$line" ]; then
+        echo "$line" | awk '{print $2, $3}' >> "$TEMP_USERLIST"
+        username=$(echo "$line" | awk '{print $1}')
+        log "Added user: $username"
     fi
 done
 

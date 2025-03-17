@@ -19,7 +19,7 @@ error_handler() {
 trap 'error_handler $LINENO' ERR
 
 # Configuration variables
-PG_VERSION="15"
+PG_VERSION="17"  # Updated to PostgreSQL 17
 DOMAIN_SUFFIX="example.com"
 ENABLE_REMOTE_ACCESS=false
 
@@ -60,6 +60,28 @@ command_exists() {
 # Function to check if a package is installed
 package_installed() {
     dpkg -l "$1" | grep -q "^ii" >/dev/null 2>&1
+}
+
+# Function to wait for PostgreSQL to be ready
+wait_for_postgresql() {
+    local max_attempts=30
+    local attempt=1
+    
+    log "Waiting for PostgreSQL to be ready..."
+    
+    while [ $attempt -le $max_attempts ]; do
+        if sudo -u postgres pg_isready -q; then
+            log "PostgreSQL is ready"
+            return 0
+        fi
+        
+        log "PostgreSQL not ready yet (attempt $attempt/$max_attempts). Waiting..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    
+    log "ERROR: PostgreSQL did not become ready after $max_attempts attempts"
+    return 1
 }
 
 # Function to create or load environment file
@@ -158,7 +180,7 @@ install_postgres() {
     apt-get install -y postgresql-$PG_VERSION postgresql-client-$PG_VERSION pgbouncer
     
     # Wait for PostgreSQL to initialize
-    sleep 5
+    sleep 10
     
     log "PostgreSQL and PgBouncer installation complete"
 }
@@ -177,7 +199,7 @@ configure_postgres() {
     if ! command_exists psql || ! systemctl is-enabled postgresql; then
         log "PostgreSQL not installed properly. Reinstalling."
         apt-get install --reinstall -y postgresql-$PG_VERSION
-        sleep 5
+        sleep 10
     fi
     
     # Check if postgresql.conf exists
@@ -271,20 +293,20 @@ EOF
         echo "host    all             all             0.0.0.0/0               md5" >> "/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
     fi
     
-    # Set PostgreSQL password if not already set
-    if systemctl is-active --quiet postgresql; then
-        log "Setting PostgreSQL password"
-        if ! sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';" 2>/dev/null; then
-            log "Failed to set PostgreSQL password. Trying again after restart."
-            systemctl restart postgresql
-            sleep 5
-            sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
-        fi
-    else
-        log "PostgreSQL service not running. Starting it."
-        systemctl start postgresql
-        sleep 5
-        log "Setting PostgreSQL password"
+    # Restart PostgreSQL to apply configuration changes
+    log "Restarting PostgreSQL to apply configuration changes"
+    systemctl restart postgresql
+    
+    # Wait for PostgreSQL to be ready
+    wait_for_postgresql
+    
+    # Set PostgreSQL password
+    log "Setting PostgreSQL password"
+    if ! sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';" 2>/dev/null; then
+        log "Failed to set PostgreSQL password. Trying again after restart."
+        systemctl restart postgresql
+        sleep 10
+        wait_for_postgresql
         sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
     fi
     
@@ -307,6 +329,9 @@ configure_pgbouncer() {
         apt-get install --reinstall -y pgbouncer
         sleep 5
     fi
+    
+    # Wait for PostgreSQL to be ready before configuring PgBouncer
+    wait_for_postgresql
     
     # Configure PgBouncer
     log "Creating PgBouncer configuration"
@@ -337,8 +362,13 @@ EOF
     
     # Create PgBouncer user list
     log "Creating PgBouncer user list"
+    
+    # Get PostgreSQL password hash
+    PG_PASSWORD_HASH=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('${PG_PASSWORD}' || 'postgres'))")
+    
+    # Create userlist.txt with proper password hash
     cat > "/etc/pgbouncer/userlist.txt" << EOF
-"postgres" "md5$(echo -n "${PG_PASSWORD}postgres" | md5sum | cut -d ' ' -f 1)"
+"postgres" "${PG_PASSWORD_HASH}"
 EOF
     
     # Set permissions
@@ -402,22 +432,39 @@ EOF
 create_demo_db() {
     log "Creating demo database and user"
     
-    # Check if PostgreSQL is running
-    if ! systemctl is-active --quiet postgresql; then
-        log "PostgreSQL is not running. Cannot create demo database."
-        return 1
-    fi
+    # Wait for PostgreSQL to be ready
+    wait_for_postgresql
     
     # Create demo database
-    sudo -u postgres psql -c "CREATE DATABASE demo;"
+    log "Creating demo database"
+    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='demo'" | grep -q 1; then
+        sudo -u postgres psql -c "CREATE DATABASE demo;"
+        log "Demo database created"
+    else
+        log "Demo database already exists"
+    fi
     
     # Create demo user
+    log "Creating demo user"
     DEMO_PASSWORD=$(openssl rand -base64 12)
-    sudo -u postgres psql -c "CREATE USER demo WITH PASSWORD '$DEMO_PASSWORD';"
+    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='demo'" | grep -q 1; then
+        sudo -u postgres psql -c "CREATE USER demo WITH PASSWORD '$DEMO_PASSWORD';"
+        log "Demo user created"
+    else
+        sudo -u postgres psql -c "ALTER USER demo WITH PASSWORD '$DEMO_PASSWORD';"
+        log "Demo user password updated"
+    fi
+    
+    # Grant privileges
     sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE demo TO demo;"
+    log "Privileges granted to demo user"
     
     # Add demo user to PgBouncer
-    echo "\"demo\" \"md5$(echo -n "${DEMO_PASSWORD}demo" | md5sum | cut -d ' ' -f 1)\"" >> /etc/pgbouncer/userlist.txt
+    # Get PostgreSQL password hash for demo user
+    DEMO_PASSWORD_HASH=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('${DEMO_PASSWORD}' || 'demo'))")
+    
+    # Add to userlist.txt
+    echo "\"demo\" \"${DEMO_PASSWORD_HASH}\"" >> /etc/pgbouncer/userlist.txt
     
     log "Demo database and user created"
     log "Demo username: demo"
@@ -490,19 +537,12 @@ main() {
     # Restart services
     log "Restarting PostgreSQL and PgBouncer"
     
-    # Check if PostgreSQL service is active before restarting
-    if systemctl is-active --quiet postgresql; then
-        systemctl restart postgresql
-    else
-        systemctl start postgresql
-    fi
+    # Restart PostgreSQL and wait for it to be ready
+    systemctl restart postgresql
+    wait_for_postgresql
     
-    # Check if PgBouncer service is active before restarting
-    if systemctl is-active --quiet pgbouncer; then
-        systemctl restart pgbouncer
-    else
-        systemctl start pgbouncer
-    fi
+    # Restart PgBouncer
+    systemctl restart pgbouncer
     
     log "Server initialization complete"
     log "PostgreSQL version $PG_VERSION installed and configured"
@@ -519,6 +559,40 @@ main() {
     echo "Environment file: /etc/dbhub/.env"
     echo "Monitoring scripts: /opt/dbhub/scripts/"
     echo "===================================="
+    
+    # Create connection info file
+    CONNECTION_INFO_FILE="connection_info.txt"
+    cat > "$CONNECTION_INFO_FILE" << EOF
+PostgreSQL Server Connection Information
+=======================================
+
+PostgreSQL Version: $PG_VERSION
+Host: $(hostname -f)
+Port: 5432
+
+Admin Connection:
+----------------
+Username: postgres
+Password: $PG_PASSWORD
+Connection String: postgresql://postgres:$PG_PASSWORD@localhost:5432/postgres
+
+PgBouncer Connection:
+-------------------
+Port: 6432
+Connection String: postgresql://postgres:$PG_PASSWORD@localhost:6432/postgres
+
+Demo Database:
+-------------
+Database: demo
+Username: demo
+Password: $DEMO_PASSWORD
+Connection String: postgresql://demo:$DEMO_PASSWORD@localhost:5432/demo
+PgBouncer Connection String: postgresql://demo:$DEMO_PASSWORD@localhost:6432/demo
+
+Generated: $(date +'%Y-%m-%d %H:%M:%S')
+EOF
+    
+    log "Connection information saved to $CONNECTION_INFO_FILE"
 }
 
 # Display usage information
