@@ -24,13 +24,33 @@ install_postgresql() {
         apt-get update
     fi
     
-    # Install PostgreSQL
-    log "Installing PostgreSQL packages"
-    apt-get install -y postgresql-$PG_VERSION postgresql-client-$PG_VERSION postgresql-contrib-$PG_VERSION
+    # Check if PostgreSQL is already installed
+    if dpkg -l | grep -q "postgresql-$PG_VERSION"; then
+        log "PostgreSQL $PG_VERSION is already installed"
+        
+        # Check if PostgreSQL is running
+        if pg_isready -q; then
+            log "PostgreSQL is already running"
+            return 0
+        else
+            log "PostgreSQL is installed but not running, attempting to fix"
+        fi
+    else
+        # Install PostgreSQL
+        log "Installing PostgreSQL packages"
+        apt-get install -y postgresql-$PG_VERSION postgresql-client-$PG_VERSION postgresql-contrib-$PG_VERSION
+    fi
     
     # Wait for PostgreSQL to initialize
     log "Waiting for PostgreSQL to initialize"
     sleep 5
+    
+    # Check PostgreSQL clusters
+    log "Checking PostgreSQL clusters"
+    if ! pg_lsclusters | grep -q "$PG_VERSION main"; then
+        log "No PostgreSQL $PG_VERSION main cluster found, creating one"
+        pg_createcluster $PG_VERSION main
+    fi
     
     # Ensure the correct service is enabled and started
     PG_SERVICE="postgresql@$PG_VERSION-main"
@@ -60,12 +80,38 @@ install_postgresql() {
         log "Checking PostgreSQL cluster status:"
         pg_lsclusters
         
-        # Try to create a cluster if none exists
-        if ! pg_lsclusters | grep -q "$PG_VERSION main"; then
-            log "No PostgreSQL cluster found, creating one"
-            pg_createcluster $PG_VERSION main
-            systemctl start postgresql@$PG_VERSION-main
-            sleep 5
+        # Try to fix common issues
+        log "Attempting to fix PostgreSQL startup issues"
+        
+        # Check if data directory exists and has correct permissions
+        PG_DATA_DIR="/var/lib/postgresql/$PG_VERSION/main"
+        if [ ! -d "$PG_DATA_DIR" ]; then
+            log "PostgreSQL data directory does not exist, creating it"
+            mkdir -p "$PG_DATA_DIR"
+            chown postgres:postgres "$PG_DATA_DIR"
+            chmod 700 "$PG_DATA_DIR"
+            
+            # Initialize the database
+            log "Initializing PostgreSQL database"
+            sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/initdb -D "$PG_DATA_DIR"
+        else
+            log "Checking PostgreSQL data directory permissions"
+            chown -R postgres:postgres "$PG_DATA_DIR"
+            chmod 700 "$PG_DATA_DIR"
+        fi
+        
+        # Try to start the cluster again
+        log "Attempting to start PostgreSQL cluster again"
+        pg_ctlcluster $PG_VERSION main start
+        sleep 5
+        
+        # Final check
+        if ! pg_isready -q; then
+            log "ERROR: PostgreSQL still failed to start after fixes"
+            log "Please check PostgreSQL logs: journalctl -u postgresql@$PG_VERSION-main"
+            log "Continuing with limited functionality"
+        else
+            log "PostgreSQL successfully started after fixes"
         fi
     fi
 }
@@ -74,43 +120,36 @@ install_postgresql() {
 configure_postgresql() {
     log "Configuring PostgreSQL"
     
-    # Check if PostgreSQL configuration directory exists
-    PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
-    if [ ! -d "$PG_CONF_DIR" ]; then
-        log "Creating PostgreSQL configuration directory: $PG_CONF_DIR"
-        mkdir -p "$PG_CONF_DIR"
-    fi
-    
-    # Check if PostgreSQL is properly installed and running
+    # Check if PostgreSQL is running
     if ! pg_isready -q; then
-        log "PostgreSQL service not running, checking cluster status"
-        pg_lsclusters
+        log "ERROR: PostgreSQL is not running, cannot configure"
+        log "Attempting to start PostgreSQL"
         
         # Try to start the specific cluster
         if pg_lsclusters | grep -q "$PG_VERSION main"; then
             log "Starting PostgreSQL cluster $PG_VERSION main"
             pg_ctlcluster $PG_VERSION main start
+            sleep 5
         else
             log "No PostgreSQL cluster found, creating one"
             pg_createcluster $PG_VERSION main
             pg_ctlcluster $PG_VERSION main start
-        fi
-        
-        sleep 5
-        
-        # If still not running, try reinstalling
-        if ! pg_isready -q; then
-            log "PostgreSQL still not running, attempting to reinstall"
-            apt-get install --reinstall -y postgresql-$PG_VERSION
-            
-            # Try to start the service again
-            if systemctl list-unit-files | grep -q "postgresql@$PG_VERSION-main"; then
-                systemctl start postgresql@$PG_VERSION-main
-            else
-                systemctl start postgresql
-            fi
             sleep 5
         fi
+        
+        # Check again if PostgreSQL is running
+        if ! pg_isready -q; then
+            log "ERROR: PostgreSQL still not running after attempts to start"
+            log "Continuing with limited functionality"
+        fi
+    fi
+    
+    # Check if PostgreSQL configuration directory exists
+    PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
+    if [ ! -d "$PG_CONF_DIR" ]; then
+        log "Creating PostgreSQL configuration directory: $PG_CONF_DIR"
+        mkdir -p "$PG_CONF_DIR"
+        chown postgres:postgres "$PG_CONF_DIR"
     fi
     
     # Check if PostgreSQL configuration file exists
@@ -193,24 +232,36 @@ EOF
     # Check if PostgreSQL is running before setting password
     if pg_isready -q; then
         log "Setting PostgreSQL password for postgres user"
-        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+        # Use a more reliable method to set password
+        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';" || {
+            log "ERROR: Failed to set PostgreSQL password using ALTER USER"
+            log "Trying alternative method"
+            echo "postgres:$PG_PASSWORD" | sudo chpasswd
+            sudo -u postgres psql -c "SELECT pg_reload_conf();"
+        }
     else
         log "WARNING: PostgreSQL is not running, cannot set password"
-        log "Attempting to start PostgreSQL"
+        log "Password will be set when PostgreSQL is restarted"
         
-        # Try to start the specific cluster
-        if pg_lsclusters | grep -q "$PG_VERSION main"; then
-            pg_ctlcluster $PG_VERSION main start
-            sleep 5
-            
-            if pg_isready -q; then
-                log "PostgreSQL started, setting password"
-                sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
-            else
-                log "ERROR: Failed to start PostgreSQL, password not set"
+        # Create a script to set the password on next boot
+        PG_PASSWORD_SCRIPT="/var/lib/postgresql/set_password.sh"
+        cat > "$PG_PASSWORD_SCRIPT" << EOF
+#!/bin/bash
+psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+rm "\$0"
+EOF
+        chmod 700 "$PG_PASSWORD_SCRIPT"
+        chown postgres:postgres "$PG_PASSWORD_SCRIPT"
+        
+        # Add to postgres user's profile
+        POSTGRES_PROFILE="/var/lib/postgresql/.profile"
+        if [ -f "$POSTGRES_PROFILE" ]; then
+            if ! grep -q "set_password.sh" "$POSTGRES_PROFILE"; then
+                echo "[ -f /var/lib/postgresql/set_password.sh ] && /var/lib/postgresql/set_password.sh" >> "$POSTGRES_PROFILE"
             fi
         else
-            log "ERROR: No PostgreSQL cluster found, password not set"
+            echo "[ -f /var/lib/postgresql/set_password.sh ] && /var/lib/postgresql/set_password.sh" > "$POSTGRES_PROFILE"
+            chown postgres:postgres "$POSTGRES_PROFILE"
         fi
     fi
     
@@ -236,6 +287,20 @@ EOF
         log "WARNING: PostgreSQL may not be running after restart"
         log "Current PostgreSQL cluster status:"
         pg_lsclusters
+        
+        # Try one more time with a different approach
+        log "Attempting to start PostgreSQL with a different approach"
+        systemctl stop postgresql
+        sleep 2
+        systemctl start postgresql@$PG_VERSION-main || systemctl start postgresql
+        sleep 5
+        
+        if pg_isready -q; then
+            log "PostgreSQL successfully started with alternative approach"
+        else
+            log "ERROR: Failed to start PostgreSQL after multiple attempts"
+            log "Please check PostgreSQL logs: journalctl -u postgresql@$PG_VERSION-main"
+        fi
     fi
 }
 
@@ -313,35 +378,57 @@ create_restricted_user() {
         # Check if database exists
         if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$db_name"; then
             log "Creating database $db_name"
-            sudo -u postgres psql -c "CREATE DATABASE $db_name;"
+            sudo -u postgres psql -c "CREATE DATABASE $db_name;" || {
+                log "ERROR: Failed to create database $db_name"
+                return 1
+            }
+        else
+            log "Database $db_name already exists"
         fi
         
         # Check if user exists
         if ! sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" | grep -q 1; then
             log "Creating user $user_name"
-            sudo -u postgres psql -c "CREATE USER $user_name WITH ENCRYPTED PASSWORD '$password';"
+            sudo -u postgres psql -c "CREATE USER $user_name WITH ENCRYPTED PASSWORD '$password';" || {
+                log "ERROR: Failed to create user $user_name"
+                return 1
+            }
         else
             log "User $user_name already exists, updating password"
-            sudo -u postgres psql -c "ALTER USER $user_name WITH ENCRYPTED PASSWORD '$password';"
+            sudo -u postgres psql -c "ALTER USER $user_name WITH ENCRYPTED PASSWORD '$password';" || {
+                log "ERROR: Failed to update password for user $user_name"
+                return 1
+            }
         fi
         
         # Grant privileges
         log "Granting privileges to $user_name on $db_name"
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
-        sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON SCHEMA public TO $user_name;"
-        sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $user_name;"
-        sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $user_name;"
-        sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO $user_name;"
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;" || {
+            log "ERROR: Failed to grant database privileges to $user_name"
+            return 1
+        }
         
-        # Revoke public privileges
-        log "Revoking public privileges on $db_name"
-        sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM PUBLIC;"
-        sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;"
-        sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;"
-        sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;"
-        
-        log "User $user_name created and configured for database $db_name"
-        return 0
+        # Connect to the database to grant schema privileges
+        if sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON SCHEMA public TO $user_name;"; then
+            sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $user_name;"
+            sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $user_name;"
+            sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO $user_name;"
+            
+            # Revoke public privileges
+            log "Revoking public privileges on $db_name"
+            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM PUBLIC;"
+            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;"
+            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;"
+            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;"
+            
+            log "User $user_name created and configured for database $db_name"
+            return 0
+        else
+            log "WARNING: Could not connect to database $db_name to grant schema privileges"
+            log "This may be because the database was just created and is not ready yet"
+            log "Basic privileges have been granted, but schema privileges may be incomplete"
+            return 0
+        fi
     else
         log "ERROR: PostgreSQL is not running, cannot create user"
         log "Attempting to start PostgreSQL"

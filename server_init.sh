@@ -49,22 +49,42 @@ main() {
     fi
     
     # Set up SSL certificates
+    SSL_SUCCESS=false
     if [ "$ENABLE_SSL" = "true" ]; then
-        setup_ssl
+        if setup_ssl; then
+            SSL_SUCCESS=true
+            log "SSL certificate setup completed successfully"
+        else
+            log "WARNING: SSL certificate setup failed"
+            log "Continuing without SSL"
+        fi
     else
         log "SSL setup skipped (set ENABLE_SSL=true to enable)"
     fi
     
     # Set up subdomain routing
+    SUBDOMAIN_SUCCESS=false
     if [ "$ENABLE_SUBDOMAIN_ROUTING" = "true" ]; then
-        setup_subdomain_routing
+        if setup_subdomain_routing; then
+            SUBDOMAIN_SUCCESS=true
+            log "Subdomain routing setup completed successfully"
+        else
+            log "WARNING: Subdomain routing setup failed"
+            log "Continuing without subdomain routing"
+        fi
     else
         log "Subdomain routing skipped (set ENABLE_SUBDOMAIN_ROUTING=true to enable)"
     fi
     
     # Create demo database and user
+    DEMO_SUCCESS=false
     if [ "$CREATE_DEMO_DB" = "true" ]; then
-        create_demo_database
+        if create_demo_database; then
+            DEMO_SUCCESS=true
+            log "Demo database creation completed successfully"
+        else
+            log "WARNING: Demo database creation failed"
+        fi
     else
         log "Demo database creation skipped (set CREATE_DEMO_DB=true to enable)"
     fi
@@ -75,7 +95,31 @@ main() {
     # Create connection info file
     create_connection_info
     
-    log "PostgreSQL server initialization completed successfully"
+    # Final status report
+    log "PostgreSQL server initialization completed"
+    
+    # Report any failures
+    if [ "$ENABLE_SSL" = "true" ] && [ "$SSL_SUCCESS" = "false" ]; then
+        log "WARNING: SSL certificate setup failed during installation"
+    fi
+    
+    if [ "$ENABLE_SUBDOMAIN_ROUTING" = "true" ] && [ "$SUBDOMAIN_SUCCESS" = "false" ]; then
+        log "WARNING: Subdomain routing setup failed during installation"
+    fi
+    
+    if [ "$CREATE_DEMO_DB" = "true" ] && [ "$DEMO_SUCCESS" = "false" ]; then
+        log "WARNING: Demo database creation failed during installation"
+    fi
+    
+    # Check if PostgreSQL is running at the end
+    if pg_isready -q; then
+        log "PostgreSQL is running successfully"
+    else
+        log "WARNING: PostgreSQL is not running at the end of installation"
+        log "Please check PostgreSQL logs: journalctl -u postgresql@$PG_VERSION-main"
+    fi
+    
+    log "Connection information saved to connection_info.txt"
 }
 
 # Function to set up environment variables
@@ -196,38 +240,58 @@ setup_ssl() {
         
         # Install certbot and dependencies
         apt-get update
-        apt-get install -y certbot python3-certbot-nginx
+        apt-get install -y certbot python3-certbot-dns-cloudflare
         
         # Check if we need a wildcard certificate
         if [[ "$DOMAIN" == *"*"* ]]; then
             log "Wildcard domain detected: $DOMAIN"
-            log "Obtaining Let's Encrypt certificate for $DOMAIN"
+            log "Setting up Cloudflare credentials for DNS validation"
             
-            # For wildcard certificates, we need to use DNS validation
-            if command_exists certbot && certbot plugins | grep -q dns-cloudflare; then
-                log "Using Cloudflare DNS validation for wildcard certificate"
-                certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.cloudflare/credentials.ini -d "$DOMAIN" -d "${DOMAIN#\*.}"
-            elif command_exists certbot && certbot plugins | grep -q dns-digitalocean; then
-                log "Using DigitalOcean DNS validation for wildcard certificate"
-                certbot certonly --dns-digitalocean --dns-digitalocean-credentials /root/.digitalocean/credentials.ini -d "$DOMAIN" -d "${DOMAIN#\*.}"
-            else
-                log "ERROR: Wildcard certificates require DNS validation"
-                log "Please install a DNS plugin for certbot and configure it"
-                log "Example: apt-get install python3-certbot-dns-cloudflare"
-                log "Certificate setup failed - cannot proceed with wildcard certificate"
-                return 1
+            # Create Cloudflare credentials directory
+            CLOUDFLARE_DIR="/root/.cloudflare"
+            mkdir -p "$CLOUDFLARE_DIR"
+            chmod 700 "$CLOUDFLARE_DIR"
+            
+            # Create Cloudflare credentials file
+            CLOUDFLARE_CREDS="$CLOUDFLARE_DIR/credentials.ini"
+            if [ ! -f "$CLOUDFLARE_CREDS" ]; then
+                if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+                    log "ERROR: CLOUDFLARE_API_TOKEN is not set in .env file"
+                    log "Please add your Cloudflare API token to the .env file"
+                    log "You can create a token at https://dash.cloudflare.com/profile/api-tokens"
+                    log "The token needs permissions: Zone.Zone:Read, Zone.DNS:Edit"
+                    return 1
+                fi
+                
+                cat > "$CLOUDFLARE_CREDS" << EOF
+# Cloudflare API token
+dns_cloudflare_api_token = $CLOUDFLARE_API_TOKEN
+EOF
+                chmod 600 "$CLOUDFLARE_CREDS"
             fi
+            
+            log "Obtaining Let's Encrypt certificate for $DOMAIN using Cloudflare DNS validation"
+            certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_CREDS" \
+                --non-interactive --agree-tos --email "$EMAIL_RECIPIENT" \
+                -d "$DOMAIN" -d "${DOMAIN#\*.}"
         else
             log "Obtaining Let's Encrypt certificate for $DOMAIN"
             certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$EMAIL_RECIPIENT"
         fi
         
         # Check if certificate was obtained successfully
-        if [ -d "/etc/letsencrypt/live/$DOMAIN" ] || [ -d "/etc/letsencrypt/live/${DOMAIN#\*.}" ]; then
+        CERT_DOMAIN="${DOMAIN#\*.}"
+        if [[ "$DOMAIN" == *"*"* ]]; then
+            CERT_DOMAIN="${DOMAIN#\*.}"
+        else
+            CERT_DOMAIN="$DOMAIN"
+        fi
+        
+        if [ -d "/etc/letsencrypt/live/$CERT_DOMAIN" ]; then
             log "Let's Encrypt certificates installed successfully"
             
             # Set permissions for PostgreSQL to read the certificates
-            CERT_DIR="/etc/letsencrypt/live/${DOMAIN#\*.}"
+            CERT_DIR="/etc/letsencrypt/live/$CERT_DOMAIN"
             if [ -d "$CERT_DIR" ]; then
                 chmod 750 "$CERT_DIR"
                 chmod 640 "$CERT_DIR/privkey.pem"
@@ -265,10 +329,13 @@ create_demo_database() {
     # Check if PostgreSQL is running
     if pg_isready -q; then
         # Create demo database and user
-        create_restricted_user "$DEMO_DB_NAME" "$DEMO_DB_USER" "$DEMO_DB_PASSWORD"
-        
-        log "Demo database created: $DEMO_DB_NAME"
-        log "Demo user created: $DEMO_DB_USER"
+        if create_restricted_user "$DEMO_DB_NAME" "$DEMO_DB_USER" "$DEMO_DB_PASSWORD"; then
+            log "Demo database created: $DEMO_DB_NAME"
+            log "Demo user created: $DEMO_DB_USER"
+        else
+            log "ERROR: Failed to create demo database and user"
+            return 1
+        fi
     else
         log "WARNING: PostgreSQL is not running, skipping demo database creation"
         
@@ -280,15 +347,20 @@ create_demo_database() {
             
             if pg_isready -q; then
                 log "PostgreSQL started, creating demo database"
-                create_restricted_user "$DEMO_DB_NAME" "$DEMO_DB_USER" "$DEMO_DB_PASSWORD"
-                
-                log "Demo database created: $DEMO_DB_NAME"
-                log "Demo user created: $DEMO_DB_USER"
+                if create_restricted_user "$DEMO_DB_NAME" "$DEMO_DB_USER" "$DEMO_DB_PASSWORD"; then
+                    log "Demo database created: $DEMO_DB_NAME"
+                    log "Demo user created: $DEMO_DB_USER"
+                else
+                    log "ERROR: Failed to create demo database and user"
+                    return 1
+                fi
             else
                 log "ERROR: Failed to start PostgreSQL, demo database not created"
+                return 1
             fi
         else
             log "ERROR: No PostgreSQL cluster found, demo database not created"
+            return 1
         fi
     fi
 }
