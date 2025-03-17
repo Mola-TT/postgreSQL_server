@@ -1,0 +1,115 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Key Requirements
+
+1. PostgreSQL Installation & Configuration
+
+Install PostgreSQL version 15.
+
+Ensure PostgreSQL is properly initialized and configured.
+
+Configure authentication with SCRAM-SHA-256 instead of MD5.
+
+Enable SSL for secure connections.
+
+Optimize default PostgreSQL settings for performance.
+
+Allow automatic subdomain-to-database mapping.
+
+2. Security Enhancements
+
+Use SCRAM-SHA-256 for PostgreSQL and PgBouncer authentication.
+
+Store and retrieve passwords securely using pgcrypto.
+
+Ensure firewall (UFW) is configured properly.
+
+Restrict default PUBLIC privileges in PostgreSQL.
+
+Implement auto-restart for PostgreSQL & PgBouncer in case of failure.
+
+3. PgBouncer Connection Pooling
+
+Install and configure PgBouncer.
+
+Use SCRAM-SHA-256 for user authentication.
+
+Enable connection pooling with proper pool mode configuration.
+
+Ensure PgBouncer's userlist.txt is updated dynamically.
+
+Implement a systemd timer instead of a cron job for regular updates.
+
+4. Server Monitoring & Auto-Healing
+
+Monitor CPU, Memory, and Disk usage.
+
+Implement email alerts for high resource usage.
+
+Provide real-time logging via journalctl.
+
+Restart PostgreSQL and PgBouncer automatically if they crash.
+
+5. Automatic Performance Tuning
+
+Auto-scale PostgreSQL settings based on CPU, RAM, and Disk size.
+
+Adjust settings like shared_buffers, work_mem, and effective_io_concurrency dynamically.
+
+Implement a self-healing mechanism for PostgreSQL clusters.
+
+6. Logging & Debugging
+
+Centralized logging script (pg_logs.sh) for PostgreSQL and PgBouncer.
+
+Provide filtering options (time-based, error-only, etc.).
+
+Log failed PostgreSQL connections and authentication errors.
+
+7. Email & Notification System
+
+Configure SMTP for email alerts.
+
+Send alerts for PostgreSQL failures, high CPU/memory/disk usage, auto-scaling performed.
+
+Send a test email after setup to confirm SMTP works.
+
+9. Database User Management
+
+Script to create restricted database users with limited access.
+
+Ensure each user is isolated to their own database.
+
+Revoke all PUBLIC privileges by default.
+
+10. Documentation & Backup
+
+Create a connection info file (connection_info.txt) with PostgreSQL credentials.
+
+Backup the .env file dynamically with timestamps.
+
+Provide manual recovery instructions for failed installations.
+
+Additional Notes
+
+The AI assistant should not remove useful features from previous versions unless necessary.
+
+Ensure all scripts are modular and easy to maintain.
+
+Use systemd services instead of cron jobs where possible.
+
+Expected Output
+
+The AI should generate:
+
+A modular Bash script implementing all features.
+
+Documentation for each script and feature.
+
+A troubleshooting guide for PostgreSQL and PgBouncer issues.
+
+Recommendations for further optimizations based on the latest best practices.
+

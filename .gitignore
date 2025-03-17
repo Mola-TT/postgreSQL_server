@@ -1,0 +1,79 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.env_backups/
+
+# Logs
+*.log
+logs/
+/var/log/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.dump
+
+# SSL certificates
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+*.cert
+
+# PostgreSQL data files
+/data/
+pg_data/
+postgresql/
+
+# PgBouncer files
+userlist.txt
+
+# Compiled binaries
+*.o
+*.so
+*.a
+*.pyc
+__pycache__/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-*
+.project
+.settings/
+.classpath
+
+# Dependency directories
+node_modules/
+vendor/
+
+# Build directories
+dist/
+build/
+target/
+
+# System files
+.directory
+.fuse_hidden*
+
+# Test files
+test-results/
+coverage/
+
+# Specific to this project
+connection_info.txt 
