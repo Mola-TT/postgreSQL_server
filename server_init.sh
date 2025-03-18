@@ -158,7 +158,11 @@ wait_for_postgresql() {
     log "Waiting for PostgreSQL to be ready..."
     
     while [ $attempt -le $max_attempts ]; do
-        if sudo -u postgres pg_isready -q; then
+        if PGPASSWORD="$PG_PASSWORD" sudo -u postgres pg_isready -q 2>/dev/null; then
+            log "PostgreSQL is ready"
+            return 0
+        elif sudo -u postgres pg_isready -q; then
+            # Also try without PGPASSWORD in case pg_isready doesn't need it
             log "PostgreSQL is ready"
             return 0
         fi
@@ -428,7 +432,7 @@ EOF
     # Set PostgreSQL password
     if [ -n "$PG_PASSWORD" ]; then
         log "Setting PostgreSQL password"
-        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+        run_postgres_command "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD'"
         log "PostgreSQL password set successfully"
         
         # Now update pg_hba.conf to use scram-sha-256 for postgres user for PgBouncer compatibility
@@ -444,11 +448,11 @@ EOF
     
     # Grant postgres user access to pg_shadow for PgBouncer auth_query
     log "Granting postgres user access to pg_shadow for PgBouncer SASL authentication"
-    sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
+    run_postgres_command "ALTER USER postgres WITH SUPERUSER;"
     
     # Revoke public schema privileges
     log "Revoking public schema privileges"
-    sudo -u postgres psql -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+    run_postgres_command "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
     
     log "PostgreSQL configuration complete"
     return 0
@@ -505,7 +509,8 @@ configure_pgbouncer() {
     # Function to get SCRAM hash for PostgreSQL user
     get_user_hash() {
         local username="$1"
-        sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';"
+        # Use our helper function to get the hash without password prompt
+        get_postgres_result "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" | xargs
     }
     
     # Ensure postgres user has access to pg_shadow for auth_query
@@ -539,7 +544,7 @@ configure_pgbouncer() {
                     log "Updating hash for user: $USERNAME"
                     
                     # Check if user exists in PostgreSQL
-                    if sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='$USERNAME'" | grep -q 1; then
+                    if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='$USERNAME'")" = "1" ]; then
                         # Get new hash
                         NEW_HASH=$(get_user_hash "$USERNAME")
                         
@@ -633,7 +638,7 @@ EOF
         # Add demo user if exists
         if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ]; then
             log "Adding demo user to PgBouncer userlist"
-            if sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'" | grep -q 1; then
+            if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'")" = "1" ]; then
                 DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
                 echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
                 log "Demo user added to PgBouncer userlist"
@@ -653,10 +658,10 @@ EOF
     
     # Verify the auth_query setup
     log "Verifying PostgreSQL permissions for auth_query"
-    if ! sudo -u postgres psql -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT');" | grep -q "t"; then
+    if [ "$(get_postgres_result "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')")" != "t" ]; then
         log "WARNING: postgres user does not have SELECT permission on pg_shadow."
         log "Granting necessary permissions for auth_query"
-        sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;" || log "Failed to grant superuser to postgres user"
+        run_postgres_command "ALTER USER postgres WITH SUPERUSER;"
     else
         log "postgres user has proper permissions for auth_query"
     fi
@@ -671,7 +676,8 @@ EOF
         
         # Verify PgBouncer configuration and connectivity
         log "Testing PgBouncer connectivity"
-        if sudo -u postgres psql -p 6432 -c "SELECT version();" > /dev/null 2>&1; then
+        # Use a test query through PgBouncer without a password prompt
+        if PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -h localhost -p 6432 -c "SELECT version();" > /dev/null 2>&1; then
             log "PgBouncer connectivity test successful"
         else
             log "WARNING: Could not connect to PgBouncer on port 6432"
@@ -784,8 +790,8 @@ create_demo_database() {
     
     # Create demo database
     log "Creating demo database"
-    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname='$db_name'" | grep -q 1; then
-        sudo -u postgres psql -c "CREATE DATABASE $db_name;"
+    if [ "$(get_postgres_result "SELECT 1 FROM pg_database WHERE datname='$db_name'")" != "1" ]; then
+        run_postgres_command "CREATE DATABASE $db_name"
         log "Demo database created"
     else
         log "Demo database already exists"
@@ -793,16 +799,16 @@ create_demo_database() {
     
     # Create demo user
     log "Creating demo user"
-    if ! sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" | grep -q 1; then
-        sudo -u postgres psql -c "CREATE USER $user_name WITH PASSWORD '$password';"
+    if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='$user_name'")" != "1" ]; then
+        run_postgres_command "CREATE USER $user_name WITH PASSWORD '$password'"
         log "Demo user created"
     else
-        sudo -u postgres psql -c "ALTER USER $user_name WITH PASSWORD '$password';"
+        run_postgres_command "ALTER USER $user_name WITH PASSWORD '$password'"
         log "Demo user password updated"
     fi
     
     # Grant privileges
-    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
+    run_postgres_command "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name"
     log "Privileges granted to demo user"
     
     log "Demo database and user created"
@@ -1135,6 +1141,49 @@ make_all_executable() {
     log "All modules and scripts are now executable"
 }
 
+# Function to run postgres commands with password environment variable to avoid prompts
+run_postgres_command() {
+    local command="$1"
+    local db_name="${2:-postgres}"  # Default to postgres database
+    
+    # Try running with PGPASSWORD
+    if [ -n "$PG_PASSWORD" ]; then
+        PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -d "$db_name" -c "$command" 2>/dev/null
+        local result=$?
+        
+        # If command successful, return
+        if [ $result -eq 0 ]; then
+            return 0
+        fi
+    fi
+    
+    # Otherwise fall back to direct command (may prompt for password)
+    sudo -u postgres psql -d "$db_name" -c "$command"
+    return $?
+}
+
+# Function to get query result from postgres
+get_postgres_result() {
+    local query="$1"
+    local db_name="${2:-postgres}"  # Default to postgres database
+    
+    # Try running with PGPASSWORD
+    if [ -n "$PG_PASSWORD" ]; then
+        local result=$(PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -d "$db_name" -tAc "$query" 2>/dev/null)
+        local exit_code=$?
+        
+        # If command successful, return result
+        if [ $exit_code -eq 0 ]; then
+            echo "$result"
+            return 0
+        fi
+    fi
+    
+    # Otherwise fall back to direct command (may prompt for password)
+    sudo -u postgres psql -d "$db_name" -tAc "$query"
+    return $?
+}
+
 # Main function
 main() {
     log "Starting server initialization"
@@ -1144,6 +1193,11 @@ main() {
     
     # Setup environment file
     setup_env_file
+    
+    # Show loaded variables
+    log "Using PG_VERSION: $PG_VERSION"
+    log "Using PG_PASSWORD: ${PG_PASSWORD:+[password set]}"
+    log "Using ENABLE_REMOTE_ACCESS: $ENABLE_REMOTE_ACCESS"
     
     # Update system
     update_system
