@@ -378,9 +378,11 @@ configure_postgresql() {
     cp /etc/postgresql/$PG_VERSION/main/pg_hba.conf "$PG_HBA_BACKUP"
     
     # Update pg_hba.conf to use SCRAM-SHA-256 authentication
+    # Using scram-sha-256 for postgres user to ensure compatibility with PgBouncer
+    # This is required for PgBouncer to authenticate with PostgreSQL using the same method
     cat > /etc/postgresql/$PG_VERSION/main/pg_hba.conf << EOF
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
-local   all             postgres                                peer
+local   all             postgres                                scram-sha-256
 local   all             all                                     scram-sha-256
 host    all             all             127.0.0.1/32            scram-sha-256
 host    all             all             ::1/128                 scram-sha-256

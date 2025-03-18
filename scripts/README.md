@@ -251,6 +251,33 @@ If you encounter issues with any script:
 3. Ensure that you're running the script with sufficient privileges (usually as root or with sudo)
 4. Check that PostgreSQL and related services are running properly
 
+### PgBouncer Authentication Issues
+
+If you encounter PgBouncer authentication errors:
+
+1. **PostgreSQL pg_hba.conf configuration**:
+   - Ensure the postgres user is configured to use scram-sha-256 authentication:
+     ```bash
+     grep postgres /etc/postgresql/*/main/pg_hba.conf
+     ```
+   - If it shows "peer" instead of "scram-sha-256", modify it:
+     ```bash
+     sed -i 's/local\s\+all\s\+postgres\s\+peer/local all postgres scram-sha-256/' /etc/postgresql/*/main/pg_hba.conf
+     systemctl restart postgresql
+     ```
+
+2. **PgBouncer userlist format**:
+   - Fix formatting issues in the userlist file:
+     ```bash
+     pgbouncer-users -f
+     ```
+
+3. **Reset user passwords**:
+   - Update a user's password in both PostgreSQL and PgBouncer:
+     ```bash
+     db-user update-password username newpassword
+     ```
+
 For detailed debugging, increase verbosity by setting the `DEBUG=true` environment variable before running most scripts:
 
 ```bash

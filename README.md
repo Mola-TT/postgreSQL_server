@@ -194,3 +194,16 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Key Features
+
+- **PostgreSQL Installation**: Automated installation and configuration of PostgreSQL
+- **PgBouncer Setup**: Connection pooling with PgBouncer for improved performance
+- **Security Hardening**: Secure configurations for PostgreSQL and PgBouncer
+  - SCRAM-SHA-256 authentication for both PostgreSQL and PgBouncer
+  - Proper pg_hba.conf configuration for PgBouncer compatibility
+  - Automatic detection and fixing of userlist formatting issues
+- **User Management**: Scripts for managing database users with proper permissions
+- **Monitoring**: System and database monitoring with email alerts
+- **Backup and Restore**: Tools for backing up and restoring databases
+- **Auto-scaling**: Automatic optimization of PostgreSQL settings based on server resources

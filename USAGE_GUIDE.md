@@ -222,6 +222,15 @@ Common PgBouncer errors and solutions:
 
 1. **"FATAL: password authentication failed"**
    - Run `sudo db-user update-password myuser mypassword` to update both PostgreSQL and PgBouncer
+   - Check if pg_hba.conf has `scram-sha-256` for the postgres user:
+     ```bash
+     sudo grep postgres /etc/postgresql/*/main/pg_hba.conf
+     ```
+   - If it shows "peer" instead of "scram-sha-256", modify it:
+     ```bash
+     sudo sed -i 's/local\s\+all\s\+postgres\s\+peer/local all postgres scram-sha-256/' /etc/postgresql/*/main/pg_hba.conf
+     sudo systemctl restart postgresql
+     ```
 
 2. **"FATAL: SASL authentication failed"**
    - Ensure SCRAM-SHA-256 authentication is configured by running `sudo pgbouncer-users`
