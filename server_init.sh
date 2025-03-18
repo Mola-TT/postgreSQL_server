@@ -922,9 +922,39 @@ Setup completed at: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
     send_email "PostgreSQL Server Setup Complete" "$message"
 }
 
+# Function to make all modules and scripts executable
+make_all_executable() {
+    log "Making all modules and scripts executable"
+    
+    # Make main script executable
+    chmod +x "${0}"
+    log "Made main script executable"
+    
+    # Make all scripts in scripts directory executable
+    if [ -d "scripts" ]; then
+        chmod +x scripts/*.sh
+        log "Made all scripts in scripts directory executable"
+    else
+        log "Scripts directory not found"
+    fi
+    
+    # Make all modules in modules directory executable
+    if [ -d "modules" ]; then
+        chmod +x modules/*.sh
+        log "Made all modules in modules directory executable"
+    else
+        log "Modules directory not found"
+    fi
+    
+    log "All modules and scripts are now executable"
+}
+
 # Main function
 main() {
     log "Starting server initialization"
+    
+    # Make all modules and scripts executable
+    make_all_executable
     
     # Setup environment file
     setup_env_file
