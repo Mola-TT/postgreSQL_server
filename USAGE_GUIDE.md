@@ -210,6 +210,9 @@ grep "myuser" /etc/pgbouncer/userlist.txt
 # Manually sync the user
 sudo pgbouncer-users -u myuser -a update
 
+# Fix formatting issues in the userlist file
+sudo pgbouncer-users -f
+
 # Sync all users and restart PgBouncer
 sudo pgbouncer-users
 sudo systemctl restart pgbouncer
@@ -225,6 +228,10 @@ Common PgBouncer errors and solutions:
 
 3. **"FATAL: unsupported startup parameter"**
    - The `ignore_startup_parameters` setting should be configured automatically. If issues persist, check `/etc/pgbouncer/pgbouncer.ini`
+
+4. **"ERROR: broken auth file"**
+   - Run `sudo pgbouncer-users -f` to detect and fix formatting issues in the userlist file
+   - This can happen if there are extra spaces or incorrect formatting in `/etc/pgbouncer/userlist.txt`
 
 #### Email Alerts Not Working
 

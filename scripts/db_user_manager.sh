@@ -42,7 +42,8 @@ user_exists() {
 # Function to get SCRAM hash for PostgreSQL user
 get_user_hash() {
     local username="$1"
-    sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';"
+    # Use xargs to properly trim all whitespace
+    sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';" | xargs
 }
 
 # Function to update PgBouncer user list
@@ -67,7 +68,6 @@ update_pgbouncer_user() {
         add|update)
             # Get user hash
             local user_hash=$(get_user_hash "$username")
-            user_hash=$(echo "$user_hash" | tr -d ' ')
             
             if [ -z "$user_hash" ]; then
                 log "Error: Could not get hash for user '$username'"

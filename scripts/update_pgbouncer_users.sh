@@ -29,7 +29,8 @@ fi
 # Function to get SCRAM hash for PostgreSQL user
 get_user_hash() {
     local username="$1"
-    sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';"
+    # Pipe output through xargs to trim whitespace completely
+    sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';" | xargs
 }
 
 # Function to update a single user in the PgBouncer userlist
@@ -48,9 +49,8 @@ update_single_user() {
     
     case "$action" in
         add|update)
-            # Get password hash
+            # Get password hash and ensure it's properly trimmed
             local password_hash=$(get_user_hash "$username")
-            password_hash=$(echo "$password_hash" | tr -d ' ')
             
             # Skip if password hash is empty
             if [ -z "$password_hash" ]; then
@@ -101,7 +101,7 @@ update_userlist() {
     
     # Get list of PostgreSQL users
     log "Getting list of PostgreSQL users"
-    local users=$(sudo -u postgres psql -t -c "SELECT rolname FROM pg_roles WHERE rolcanlogin;" | tr -d ' ')
+    local users=$(sudo -u postgres psql -t -c "SELECT rolname FROM pg_roles WHERE rolcanlogin;" | grep -v "^\s*$" | xargs -n1)
     
     # Create new userlist file
     echo "# PgBouncer userlist - Updated on $(date)" > "$PGBOUNCER_USERLIST.new"
@@ -114,9 +114,8 @@ update_userlist() {
             continue
         fi
         
-        # Get password hash
+        # Get password hash (properly trimmed with xargs)
         local password_hash=$(get_user_hash "$username")
-        password_hash=$(echo "$password_hash" | tr -d ' ')
         
         # Skip if password hash is empty
         if [ -z "$password_hash" ]; then
@@ -135,6 +134,55 @@ update_userlist() {
     chmod 640 "$PGBOUNCER_USERLIST"
     
     log "PgBouncer userlist updated successfully"
+}
+
+# After updating the userlist, verify it's valid
+verify_userlist() {
+    log "Verifying PgBouncer userlist format"
+    
+    # Check if file exists
+    if [ ! -f "$PGBOUNCER_USERLIST" ]; then
+        log "ERROR: PgBouncer userlist file not found at $PGBOUNCER_USERLIST"
+        return 1
+    fi
+    
+    # Check each line in the userlist file
+    local line_num=0
+    local has_error=false
+    
+    while IFS= read -r line; do
+        ((line_num++))
+        
+        # Skip comments and empty lines
+        if [[ "$line" =~ ^[[:space:]]*# || -z "${line// /}" ]]; then
+            continue
+        fi
+        
+        # Validate line format - should be "username" "password"
+        if ! [[ "$line" =~ ^\"[^\"]+\"[[:space:]]+\"[^\"]+\"$ ]]; then
+            log "ERROR: Invalid format in userlist at line $line_num: $line"
+            has_error=true
+        fi
+    done < "$PGBOUNCER_USERLIST"
+    
+    if [ "$has_error" = true ]; then
+        log "WARNING: Found formatting issues in userlist file"
+        
+        # Create a clean backup just in case
+        local backup_file="${PGBOUNCER_USERLIST}.malformed.$(date +'%Y%m%d%H%M%S').bak"
+        cp "$PGBOUNCER_USERLIST" "$backup_file"
+        log "Created backup of problematic userlist: $backup_file"
+        
+        # Try to fix common formatting issues
+        log "Attempting to fix formatting issues..."
+        sed -i 's/^"\([^"]*\)" "\s\+\([^"]*\)"$/"\1" "\2"/g' "$PGBOUNCER_USERLIST"
+        
+        log "Fixed potential formatting issues in userlist"
+        return 1
+    else
+        log "PgBouncer userlist format verified successfully"
+        return 0
+    fi
 }
 
 # Function to ensure auth_type is set to scram-sha-256
@@ -218,12 +266,14 @@ usage() {
     echo "  -a, --action ACTION     Action for single user: add, update, delete"
     echo "  -s, --skip-reload       Skip reloading PgBouncer after update"
     echo "  -q, --quiet             Suppress output except for errors"
+    echo "  -f, --fix-userlist      Fix formatting issues in userlist file without updating users"
     echo
     echo "Examples:"
     echo "  $0                      Update all users (default behavior)"
     echo "  $0 -u myuser -a add     Add or update a single user"
     echo "  $0 -u myuser -a delete  Remove a user from PgBouncer"
     echo "  $0 -s                   Update all users but don't reload PgBouncer"
+    echo "  $0 -f                   Fix formatting issues in userlist.txt only"
 }
 
 # Main function
@@ -232,6 +282,7 @@ main() {
     local action=""
     local skip_reload=false
     local quiet_mode=false
+    local fix_userlist=false
     
     # Parse command-line arguments
     while [[ $# -gt 0 ]]; do
@@ -271,6 +322,10 @@ main() {
                 quiet_mode=true
                 shift
                 ;;
+            -f|--fix-userlist)
+                fix_userlist=true
+                shift
+                ;;
             *)
                 log "ERROR: Unknown option: $1"
                 usage
@@ -288,6 +343,22 @@ main() {
     fi
     
     log "Starting PgBouncer users update"
+    
+    # If requested to fix userlist only, do that and exit
+    if [ "$fix_userlist" = true ]; then
+        log "Running in fix userlist mode only"
+        verify_userlist
+        
+        # Reload PgBouncer if not skipped
+        if [ "$skip_reload" = false ]; then
+            reload_pgbouncer
+        else
+            log "Skipping PgBouncer reload as requested"
+        fi
+        
+        log "PgBouncer userlist fix completed"
+        exit 0
+    fi
     
     # Update authentication configuration (always do this)
     update_auth_type
@@ -308,6 +379,9 @@ main() {
         log "Processing all users mode"
         update_userlist
     fi
+    
+    # Always verify the userlist after updating
+    verify_userlist
     
     # Reload PgBouncer if not skipped
     if [ "$skip_reload" = false ]; then

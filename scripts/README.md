@@ -99,6 +99,8 @@ A utility script that synchronizes PostgreSQL users with PgBouncer's authenticat
 - Integrates with db_user_manager.sh for real-time updates
 - Includes command-line arguments for flexible usage
 - Provides quiet mode for automated/scripted usage
+- Detects and fixes formatting issues in userlist file automatically
+- Properly handles whitespace in password hashes to prevent broken authentication
 
 This script is typically scheduled to run daily to ensure PgBouncer's user list stays in sync with PostgreSQL. It can also be called on-demand for individual user updates by the db_user_manager.sh script.
 
@@ -118,6 +120,9 @@ sudo ./update_pgbouncer_users.sh -s
 
 # Quiet mode for scripted usage
 sudo ./update_pgbouncer_users.sh -q -u myuser -a update
+
+# Fix formatting issues in userlist.txt without updating users
+sudo ./update_pgbouncer_users.sh -f
 ```
 
 ### pg_auto_scale.sh
