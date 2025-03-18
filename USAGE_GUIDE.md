@@ -18,8 +18,10 @@ This guide explains how to use the DBHub.cc server setup scripts to create and m
 
 3. **Run the installation script**:
    ```bash
-   sudo ./server_init.sh
+   sudo ./server_init.sh install
    ```
+
+   Note: The installation script automatically makes all modules and scripts executable, so you no longer need to manually run `chmod +x` commands before running the script.
 
 ## Configuration Options
 
@@ -27,7 +29,7 @@ Edit the `.env` file to customize your installation:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PG_VERSION` | PostgreSQL version to install | 15 |
+| `PG_VERSION` | PostgreSQL version to install | 17 |
 | `PG_PASSWORD` | PostgreSQL admin password | (random) |
 | `DOMAIN_SUFFIX` | Domain for subdomain routing | example.com |
 | `ENABLE_REMOTE_ACCESS` | Allow remote connections | false |
@@ -165,6 +167,14 @@ Ensure your DNS is properly configured and check PostgreSQL logs:
 sudo tail -f /var/log/postgresql/postgresql-*.log
 ```
 
+#### Script Execution Errors
+
+If you're getting permissions errors when running scripts, make sure the script is executable:
+```bash
+sudo ./server_init.sh install
+```
+The server initialization script automatically makes all modules and scripts executable.
+
 ## Security Best Practices
 
 1. **Change default passwords** immediately after installation
@@ -188,7 +198,7 @@ sudo nano /etc/pgbouncer/pgbouncer.ini
 
 Edit the PostgreSQL configuration file:
 ```bash
-sudo nano /etc/postgresql/15/main/postgresql.conf
+sudo nano /etc/postgresql/17/main/postgresql.conf
 ```
 
 ### Customizing Nginx

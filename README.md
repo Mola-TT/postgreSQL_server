@@ -37,16 +37,12 @@ This project provides a comprehensive set of scripts for:
    cd dbhub.cc
    ```
 
-2. Make the scripts executable:
-   ```
-   chmod +x server_init.sh
-   chmod +x scripts/*.sh
-   ```
-
-3. Run the server initialization script:
+2. Run the server initialization script:
    ```
    sudo ./server_init.sh install
    ```
+
+   Note: The script automatically makes all modules and scripts executable, so you no longer need to manually run `chmod +x` commands before running the script.
 
 ## Configuration
 
