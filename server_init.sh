@@ -487,6 +487,13 @@ configure_pgbouncer() {
         log "PostgreSQL SSL directory already exists"
     fi
     
+    # Create a backup of PgBouncer configuration if it exists
+    if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
+        BACKUP_FILE="/etc/pgbouncer/pgbouncer.ini.$(date +'%Y%m%d%H%M%S').bak"
+        log "Creating backup of existing PgBouncer configuration: $BACKUP_FILE"
+        cp "/etc/pgbouncer/pgbouncer.ini" "$BACKUP_FILE"
+    fi
+    
     # Configure PgBouncer
     log "Creating PgBouncer configuration"
     cat > "/etc/pgbouncer/pgbouncer.ini" << EOF
@@ -513,6 +520,9 @@ max_db_connections = 50
 max_user_connections = 50
 server_round_robin = 0
 
+# Ignore PostgreSQL parameters not supported by PgBouncer
+ignore_startup_parameters = extra_float_digits
+
 # SSL settings
 client_tls_sslmode = allow
 client_tls_key_file = /etc/postgresql/ssl/server.key
@@ -521,6 +531,7 @@ EOF
     
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
+    log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
     # Create PgBouncer user list
     log "Creating PgBouncer user list"

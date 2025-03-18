@@ -127,52 +127,26 @@ A utility that creates and manages Nginx configurations for database subdomains,
 
 This script enables accessing databases through URLs like `dbname.yourdomain.com` with automatic routing to the correct database.
 
-### fix_pgbouncer_ssl.sh
+## Integrated Features
 
-A utility script that enables SSL support in PgBouncer for existing installations, fixing the "The server does not support SSL" error when connecting to PgBouncer externally.
+The following functionality is directly integrated into the main `server_init.sh` script:
 
-**Key features:**
-- Enables SSL support in PgBouncer configuration
-- Creates self-signed SSL certificates if they don't exist
-- Sets proper permissions for SSL certificates
-- Updates PgBouncer configuration to use SSL
-- Backs up existing configuration before making changes
-- Restarts PgBouncer service to apply changes
-- Provides detailed logging of the process
-- Works with both new and existing installations
+### SSL Support for PgBouncer
 
-This script is useful when you need to connect to PgBouncer externally with an SSL-enabled client and encounter the "The server does not support SSL" error.
+The main installation script automatically configures SSL support for PgBouncer, including:
+- Creating self-signed SSL certificates if they don't exist
+- Setting proper permissions for SSL certificates
+- Configuring PgBouncer to use SSL
+- Setting client_tls_sslmode to allow both SSL and non-SSL connections
 
-### install_monitoring.sh
+### PgBouncer Parameter Handling
 
-A comprehensive monitoring infrastructure setup script that installs and configures Prometheus, Grafana, and related exporters.
+The main installation script automatically configures PgBouncer to handle unsupported PostgreSQL parameters:
+- Adds `ignore_startup_parameters = extra_float_digits` to PgBouncer configuration
+- Fixes the "FATAL: unsupported startup parameter: extra_float_digits" error
+- Properly sets file permissions after configuration
 
-**Key features:**
-- Installs Prometheus for metrics collection
-- Sets up Grafana for visualization dashboards
-- Configures Node Exporter for system metrics
-- Installs PostgreSQL Exporter for database metrics
-- Creates pre-configured dashboards for PostgreSQL monitoring
-- Sets up alerting rules and notification channels
-- Configures authentication and security
-- Enables automatic startup on boot
-
-This script provides a complete monitoring solution with visual dashboards for tracking system and database performance.
-
-### nginx_template.conf
-
-A template configuration file for Nginx used by the create_db_subdomain.sh script to create database-specific server blocks.
-
-**Key features:**
-- Defines server configuration template for database subdomains
-- Includes proxy settings for database routing
-- Contains placeholders for dynamic values (subdomain, domain suffix, etc.)
-- Includes SSL/TLS configuration options
-- Sets up logging parameters
-- Defines security headers
-- Provides performance optimization settings
-
-While not an executable script itself, this template is essential for the subdomain functionality provided by create_db_subdomain.sh.
+Both of these features are integrated into the `configure_pgbouncer()` function in the main script, eliminating the need for separate fix scripts.
 
 ## Using These Scripts
 
@@ -193,9 +167,6 @@ sudo ./backup_postgres.sh
 
 # Example: Restoring a database
 sudo ./restore_postgres.sh restore-db latest mydb
-
-# Example: Fixing PgBouncer SSL support
-sudo ./fix_pgbouncer_ssl.sh
 ```
 
 When installed via the main server_init.sh script, these scripts are copied to a system location (typically /usr/local/bin) and can be executed from anywhere.
