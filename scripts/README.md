@@ -146,7 +146,21 @@ The main installation script automatically configures PgBouncer to handle unsupp
 - Fixes the "FATAL: unsupported startup parameter: extra_float_digits" error
 - Properly sets file permissions after configuration
 
-Both of these features are integrated into the `configure_pgbouncer()` function in the main script, eliminating the need for separate fix scripts.
+### PgBouncer Authentication
+
+The main installation script configures PgBouncer to use SCRAM-SHA-256 authentication, which:
+- Matches the PostgreSQL authentication method
+- Uses properly formatted SCRAM password hashes in userlist.txt
+- Automatically adds all database users to PgBouncer with correct auth
+- Prevents "FATAL: password authentication failed" errors
+
+The script also handles upgrading existing installations:
+- Detects when an existing PgBouncer installation uses MD5 authentication
+- Creates backups of all configuration files before making changes
+- Automatically converts existing user password hashes to SCRAM-SHA-256 format
+- Properly restarts PgBouncer to apply changes
+
+All these features are integrated directly into the `configure_pgbouncer()` function in the main script, eliminating the need for separate fix scripts.
 
 ## Using These Scripts
 

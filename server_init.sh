@@ -487,11 +487,59 @@ configure_pgbouncer() {
         log "PostgreSQL SSL directory already exists"
     fi
     
+    # Function to get SCRAM hash for PostgreSQL user
+    get_user_hash() {
+        local username="$1"
+        sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';"
+    }
+    
     # Create a backup of PgBouncer configuration if it exists
     if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
         BACKUP_FILE="/etc/pgbouncer/pgbouncer.ini.$(date +'%Y%m%d%H%M%S').bak"
         log "Creating backup of existing PgBouncer configuration: $BACKUP_FILE"
         cp "/etc/pgbouncer/pgbouncer.ini" "$BACKUP_FILE"
+        
+        # For existing installations, check if auth_type needs to be updated
+        if grep -q "^auth_type.*=.*md5" "/etc/pgbouncer/pgbouncer.ini"; then
+            log "Existing PgBouncer installation uses MD5 authentication. Updating to SCRAM-SHA-256."
+            
+            # Create a backup of userlist.txt if it exists
+            if [ -f "/etc/pgbouncer/userlist.txt" ]; then
+                USERLIST_BACKUP="/etc/pgbouncer/userlist.txt.$(date +'%Y%m%d%H%M%S').bak"
+                log "Creating backup of existing PgBouncer userlist: $USERLIST_BACKUP"
+                cp "/etc/pgbouncer/userlist.txt" "$USERLIST_BACKUP"
+                
+                # Get list of users from PgBouncer userlist
+                USERS=$(grep -E '^"[^"]+"\s+"' "/etc/pgbouncer/userlist.txt" | sed -E 's/^"([^"]+)".*/\1/')
+                
+                # Create new userlist with SCRAM-SHA-256 passwords
+                echo "# Updated by server_init.sh on $(date)" > "/etc/pgbouncer/userlist.txt.new"
+                
+                # Process each user
+                for USERNAME in $USERS; do
+                    log "Updating hash for user: $USERNAME"
+                    
+                    # Check if user exists in PostgreSQL
+                    if sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='$USERNAME'" | grep -q 1; then
+                        # Get new hash
+                        NEW_HASH=$(get_user_hash "$USERNAME")
+                        
+                        # Add to new userlist
+                        echo "\"$USERNAME\" \"$NEW_HASH\"" >> "/etc/pgbouncer/userlist.txt.new"
+                        log "Added $USERNAME with SCRAM-SHA-256 hash to new userlist"
+                    else
+                        log "WARNING: User $USERNAME not found in PostgreSQL, skipping"
+                    fi
+                done
+                
+                # Replace old userlist with new one
+                mv "/etc/pgbouncer/userlist.txt.new" "/etc/pgbouncer/userlist.txt"
+                chown postgres:postgres "/etc/pgbouncer/userlist.txt"
+                chmod 640 "/etc/pgbouncer/userlist.txt"
+                
+                log "PgBouncer userlist updated with SCRAM-SHA-256 hashes"
+            fi
+        fi
     fi
     
     # Configure PgBouncer
@@ -505,7 +553,7 @@ logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
 listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
-auth_type = md5
+auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
 admin_users = postgres
 stats_users = postgres
@@ -531,18 +579,33 @@ EOF
     
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
+    log "PgBouncer authentication set to scram-sha-256 to match PostgreSQL"
     log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
-    # Create PgBouncer user list
-    log "Creating PgBouncer user list"
-    
-    # Get PostgreSQL password hash
-    PG_PASSWORD_HASH=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('${PG_PASSWORD}' || 'postgres'))")
-    
-    # Create userlist.txt with proper password hash
-    cat > "/etc/pgbouncer/userlist.txt" << EOF
-"postgres" "${PG_PASSWORD_HASH}"
+    # Create PgBouncer user list if it doesn't exist or was not already updated
+    if [ ! -f "/etc/pgbouncer/userlist.txt" ]; then
+        log "Creating new PgBouncer userlist.txt"
+        
+        # Create userlist.txt with proper password hash for postgres
+        POSTGRES_PASSWORD_HASH=$(get_user_hash "postgres")
+        
+        # Create userlist.txt file
+        cat > "/etc/pgbouncer/userlist.txt" << EOF
+"postgres" "$POSTGRES_PASSWORD_HASH"
 EOF
+        
+        # Add demo user if exists
+        if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ]; then
+            log "Adding demo user to PgBouncer userlist"
+            if sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'" | grep -q 1; then
+                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
+                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
+                log "Demo user added to PgBouncer userlist"
+            else
+                log "Demo user not found in PostgreSQL, skipping"
+            fi
+        fi
+    fi
     
     # Set permissions
     chown postgres:postgres /etc/pgbouncer/pgbouncer.ini
@@ -551,6 +614,18 @@ EOF
     chmod 640 /etc/pgbouncer/userlist.txt
     
     log "PgBouncer configuration complete"
+    
+    # Restart PgBouncer to apply changes
+    log "Restarting PgBouncer"
+    systemctl restart pgbouncer
+    
+    # Verify PgBouncer is running
+    if systemctl is-active --quiet pgbouncer; then
+        log "PgBouncer successfully restarted"
+    else
+        log "ERROR: PgBouncer failed to restart. Checking logs..."
+        journalctl -u pgbouncer --no-pager -n 20
+    fi
 }
 
 # Function to configure firewall
@@ -665,13 +740,6 @@ create_demo_database() {
     # Grant privileges
     sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
     log "Privileges granted to demo user"
-    
-    # Add demo user to PgBouncer
-    # Get PostgreSQL password hash for demo user
-    DEMO_PASSWORD_HASH=$(sudo -u postgres psql -t -c "SELECT concat('md5', md5('${password}' || '${user_name}'))")
-    
-    # Add to userlist.txt
-    echo "\"$user_name\" \"${DEMO_PASSWORD_HASH}\"" >> /etc/pgbouncer/userlist.txt
     
     log "Demo database and user created"
     log "Demo username: $user_name"
