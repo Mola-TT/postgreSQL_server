@@ -7,7 +7,6 @@ Guidelines:
 1. **Development Environment**
    - The script is developed on a Windows machine.
    - The script is not executed on Windows but will run on an Ubuntu server.
-   - Use WSL (if needed) for compatibility checks.
 
 2. **GitHub Workflow**
    - Each commit should contain only **one function change**.
@@ -16,3 +15,24 @@ Guidelines:
 
 3. **Automatic Git Commit & Push Script**
    - Use a PowerShell to handle commits and push changes to GitHub.
+
+# Issue Handling Guidelines
+
+## ❌ What NOT to Do
+- **Do NOT create a separate hotfix script.**  
+  - Avoid patching issues with temporary fixes.
+  - Keep the initialization script as the single source of truth.
+
+## ✅ What to Do Instead
+1. **Fix the initialization script directly.**  
+   - Identify and correct the issue in the main script.
+   - Ensure the fix integrates smoothly into the existing setup process.
+
+2. **Push the updated script to GitHub.**  
+   - Commit the changes with a clear message describing the fix.
+   - Use the automated Git push script if available.
+
+## 🎯 Goal
+- Maintain a **clean and maintainable** setup process.
+- Ensure **consistent deployments** without scattered fixes.
+- Keep the script **self-sufficient and reliable**.
