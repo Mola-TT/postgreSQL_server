@@ -127,6 +127,22 @@ A utility that creates and manages Nginx configurations for database subdomains,
 
 This script enables accessing databases through URLs like `dbname.yourdomain.com` with automatic routing to the correct database.
 
+### fix_pgbouncer_ssl.sh
+
+A utility script that enables SSL support in PgBouncer for existing installations, fixing the "The server does not support SSL" error when connecting to PgBouncer externally.
+
+**Key features:**
+- Enables SSL support in PgBouncer configuration
+- Creates self-signed SSL certificates if they don't exist
+- Sets proper permissions for SSL certificates
+- Updates PgBouncer configuration to use SSL
+- Backs up existing configuration before making changes
+- Restarts PgBouncer service to apply changes
+- Provides detailed logging of the process
+- Works with both new and existing installations
+
+This script is useful when you need to connect to PgBouncer externally with an SSL-enabled client and encounter the "The server does not support SSL" error.
+
 ### install_monitoring.sh
 
 A comprehensive monitoring infrastructure setup script that installs and configures Prometheus, Grafana, and related exporters.
@@ -177,6 +193,9 @@ sudo ./backup_postgres.sh
 
 # Example: Restoring a database
 sudo ./restore_postgres.sh restore-db latest mydb
+
+# Example: Fixing PgBouncer SSL support
+sudo ./fix_pgbouncer_ssl.sh
 ```
 
 When installed via the main server_init.sh script, these scripts are copied to a system location (typically /usr/local/bin) and can be executed from anywhere.

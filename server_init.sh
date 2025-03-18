@@ -459,6 +459,34 @@ configure_pgbouncer() {
     # Wait for PostgreSQL to be ready before configuring PgBouncer
     wait_for_postgresql
     
+    # Ensure SSL directory and certificates exist
+    SSL_DIR="/etc/postgresql/ssl"
+    if [ ! -d "$SSL_DIR" ]; then
+        log "Creating PostgreSQL SSL directory"
+        mkdir -p "$SSL_DIR"
+        
+        # Create self-signed SSL certificate if it doesn't exist
+        if [ ! -f "$SSL_DIR/server.crt" ] || [ ! -f "$SSL_DIR/server.key" ]; then
+            log "Generating self-signed SSL certificate for PgBouncer"
+            apt-get install -y openssl
+            
+            openssl req -new -x509 -days "${SSL_CERT_VALIDITY:-365}" -nodes \
+                -out "$SSL_DIR/server.crt" \
+                -keyout "$SSL_DIR/server.key" \
+                -subj "/C=${SSL_COUNTRY:-US}/ST=${SSL_STATE:-State}/L=${SSL_LOCALITY:-City}/O=${SSL_ORGANIZATION:-Organization}/CN=${SSL_COMMON_NAME:-localhost}"
+            
+            chmod 640 "$SSL_DIR/server.key"
+            chmod 644 "$SSL_DIR/server.crt"
+            chown postgres:postgres "$SSL_DIR/server.key" "$SSL_DIR/server.crt"
+            
+            log "Self-signed SSL certificate generated"
+        else
+            log "SSL certificates already exist"
+        fi
+    else
+        log "PostgreSQL SSL directory already exists"
+    fi
+    
     # Configure PgBouncer
     log "Creating PgBouncer configuration"
     cat > "/etc/pgbouncer/pgbouncer.ini" << EOF
@@ -484,9 +512,15 @@ reserve_pool_timeout = 3
 max_db_connections = 50
 max_user_connections = 50
 server_round_robin = 0
+
+# SSL settings
+client_tls_sslmode = allow
+client_tls_key_file = /etc/postgresql/ssl/server.key
+client_tls_cert_file = /etc/postgresql/ssl/server.crt
 EOF
     
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
+    log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
     
     # Create PgBouncer user list
     log "Creating PgBouncer user list"
