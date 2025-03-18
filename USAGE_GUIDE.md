@@ -242,6 +242,22 @@ Common PgBouncer errors and solutions:
    - Run `sudo pgbouncer-users -f` to detect and fix formatting issues in the userlist file
    - This can happen if there are extra spaces or incorrect formatting in `/etc/pgbouncer/userlist.txt`
 
+5. **Authentication issues during installation or password change**
+   - The initialization script uses a smart authentication sequence:
+     1. Initially sets peer authentication for postgres user to allow password setting
+     2. After setting the password, switches to scram-sha-256 for PgBouncer compatibility
+   - If you experience issues, you can manually toggle between these modes:
+     ```bash
+     # To temporarily use peer auth for setting password
+     sudo sed -i 's/local all postgres scram-sha-256/local all postgres peer/' /etc/postgresql/*/main/pg_hba.conf
+     sudo systemctl restart postgresql
+     sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'your_password';"
+     
+     # Then switch back to scram-sha-256 for PgBouncer compatibility
+     sudo sed -i 's/local all postgres peer/local all postgres scram-sha-256/' /etc/postgresql/*/main/pg_hba.conf
+     sudo systemctl restart postgresql
+     ```
+
 #### Email Alerts Not Working
 
 Verify your SMTP settings in the `.env` file and test with:

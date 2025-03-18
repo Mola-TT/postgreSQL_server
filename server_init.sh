@@ -365,24 +365,32 @@ configure_postgresql() {
     PG_CONF_BACKUP="/etc/postgresql/$PG_VERSION/main/postgresql.conf.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
     cp /etc/postgresql/$PG_VERSION/main/postgresql.conf "$PG_CONF_BACKUP"
     
+    # Update postgresql.conf
     # Always configure PostgreSQL to listen on all interfaces for better flexibility
     # Security will be controlled via pg_hba.conf
     sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
     log "PostgreSQL configured to listen on all interfaces"
     
-    # Configure PostgreSQL authentication
+    # Configure authentication
     log "Configuring PostgreSQL authentication"
+    
+    # Enable password encryption using SCRAM-SHA-256
+    sed -i "s/#password_encryption = md5/password_encryption = scram-sha-256/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
+    
+    # Security will be controlled via pg_hba.conf
     
     # Backup original pg_hba.conf
     PG_HBA_BACKUP="/etc/postgresql/$PG_VERSION/main/pg_hba.conf.$(TZ=Asia/Singapore date +%Y%m%d%H%M%S).bak"
     cp /etc/postgresql/$PG_VERSION/main/pg_hba.conf "$PG_HBA_BACKUP"
     
-    # Update pg_hba.conf to use SCRAM-SHA-256 authentication
-    # Using scram-sha-256 for postgres user to ensure compatibility with PgBouncer
-    # This is required for PgBouncer to authenticate with PostgreSQL using the same method
+    # Update pg_hba.conf to initially use peer authentication for postgres user
+    # This allows us to set the password without having one yet
+    # IMPORTANT: We temporarily use 'peer' authentication for the postgres user to allow 
+    # setting the password. After the password is set, we switch to 'scram-sha-256' for
+    # compatibility with PgBouncer.
     cat > /etc/postgresql/$PG_VERSION/main/pg_hba.conf << EOF
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
-local   all             postgres                                scram-sha-256
+local   all             postgres                                peer
 local   all             all                                     scram-sha-256
 host    all             all             127.0.0.1/32            scram-sha-256
 host    all             all             ::1/128                 scram-sha-256
@@ -395,14 +403,7 @@ EOF
         log "Remote access enabled in PostgreSQL configuration"
     else
         log "Remote access is disabled. PostgreSQL will only accept local connections."
-        log "To enable remote access, set ENABLE_REMOTE_ACCESS=true in your .env file and run the script again."
     fi
-    
-    # Configure PostgreSQL settings
-    log "Configuring PostgreSQL security settings"
-    
-    # Update postgresql.conf for SCRAM-SHA-256 authentication
-    sed -i "s/^#password_encryption = .*/password_encryption = 'scram-sha-256'/" /etc/postgresql/$PG_VERSION/main/postgresql.conf
     
     # Restart PostgreSQL to apply configuration changes
     log "Restarting PostgreSQL to apply configuration changes"
@@ -429,6 +430,14 @@ EOF
         log "Setting PostgreSQL password"
         sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
         log "PostgreSQL password set successfully"
+        
+        # Now update pg_hba.conf to use scram-sha-256 for postgres user for PgBouncer compatibility
+        log "Updating pg_hba.conf to use SCRAM-SHA-256 for postgres user"
+        sed -i 's/local\s\+all\s\+postgres\s\+peer/local all postgres scram-sha-256/' /etc/postgresql/$PG_VERSION/main/pg_hba.conf
+        log "Restarting PostgreSQL to apply authentication changes"
+        systemctl restart postgresql
+        sleep 3
+        log "PostgreSQL restarted with updated authentication configuration"
     else
         log "WARNING: PG_PASSWORD not set. Skipping password configuration."
     fi

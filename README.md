@@ -203,6 +203,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
   - SCRAM-SHA-256 authentication for both PostgreSQL and PgBouncer
   - Proper pg_hba.conf configuration for PgBouncer compatibility
   - Automatic detection and fixing of userlist formatting issues
+  - Smart authentication sequence that handles password setup correctly
 - **User Management**: Scripts for managing database users with proper permissions
 - **Monitoring**: System and database monitoring with email alerts
 - **Backup and Restore**: Tools for backing up and restoring databases
