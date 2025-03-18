@@ -431,6 +431,10 @@ EOF
         log "WARNING: PG_PASSWORD not set. Skipping password configuration."
     fi
     
+    # Grant postgres user access to pg_shadow for PgBouncer auth_query
+    log "Granting postgres user access to pg_shadow for PgBouncer SASL authentication"
+    sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
+    
     # Revoke public schema privileges
     log "Revoking public schema privileges"
     sudo -u postgres psql -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
@@ -493,6 +497,10 @@ configure_pgbouncer() {
         sudo -u postgres psql -t -c "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username';"
     }
     
+    # Ensure postgres user has access to pg_shadow for auth_query
+    log "Ensuring postgres user has appropriate permissions for auth_query"
+    sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;" || log "Warning: Could not set postgres as superuser, may already be a superuser"
+    
     # Create a backup of PgBouncer configuration if it exists
     if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
         BACKUP_FILE="/etc/pgbouncer/pgbouncer.ini.$(date +'%Y%m%d%H%M%S').bak"
@@ -540,6 +548,20 @@ configure_pgbouncer() {
                 log "PgBouncer userlist updated with SCRAM-SHA-256 hashes"
             fi
         fi
+        
+        # Check if auth_query exists (for SASL authentication)
+        if ! grep -q "^auth_query" "/etc/pgbouncer/pgbouncer.ini"; then
+            log "Adding auth_query to PgBouncer configuration for SASL authentication support"
+            # Create a temporary file with updated configuration
+            sed '/^\[pgbouncer\]/a auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=$1\nauth_user = postgres' "/etc/pgbouncer/pgbouncer.ini" > "/etc/pgbouncer/pgbouncer.ini.new"
+            # Replace the original configuration with the updated one
+            mv "/etc/pgbouncer/pgbouncer.ini.new" "/etc/pgbouncer/pgbouncer.ini"
+            chown postgres:postgres "/etc/pgbouncer/pgbouncer.ini"
+            chmod 640 "/etc/pgbouncer/pgbouncer.ini"
+            log "auth_query added to PgBouncer configuration"
+        else
+            log "auth_query already exists in PgBouncer configuration"
+        fi
     fi
     
     # Configure PgBouncer
@@ -555,6 +577,8 @@ listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
 auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
+auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=\$1
+auth_user = postgres
 admin_users = postgres
 stats_users = postgres
 pool_mode = ${POOL_MODE:-transaction}
@@ -580,6 +604,7 @@ EOF
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
     log "PgBouncer authentication set to scram-sha-256 to match PostgreSQL"
+    log "PgBouncer auth_query added to properly support SASL authentication"
     log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
     # Create PgBouncer user list if it doesn't exist or was not already updated
@@ -615,6 +640,16 @@ EOF
     
     log "PgBouncer configuration complete"
     
+    # Verify the auth_query setup
+    log "Verifying PostgreSQL permissions for auth_query"
+    if ! sudo -u postgres psql -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT');" | grep -q "t"; then
+        log "WARNING: postgres user does not have SELECT permission on pg_shadow."
+        log "Granting necessary permissions for auth_query"
+        sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;" || log "Failed to grant superuser to postgres user"
+    else
+        log "postgres user has proper permissions for auth_query"
+    fi
+    
     # Restart PgBouncer to apply changes
     log "Restarting PgBouncer"
     systemctl restart pgbouncer
@@ -622,9 +657,27 @@ EOF
     # Verify PgBouncer is running
     if systemctl is-active --quiet pgbouncer; then
         log "PgBouncer successfully restarted"
+        
+        # Verify PgBouncer configuration and connectivity
+        log "Testing PgBouncer connectivity"
+        if sudo -u postgres psql -p 6432 -c "SELECT version();" > /dev/null 2>&1; then
+            log "PgBouncer connectivity test successful"
+        else
+            log "WARNING: Could not connect to PgBouncer on port 6432"
+            log "Checking PgBouncer logs for errors:"
+            tail -n 20 /var/log/postgresql/pgbouncer.log || log "Could not read PgBouncer logs"
+        fi
     else
         log "ERROR: PgBouncer failed to restart. Checking logs..."
         journalctl -u pgbouncer --no-pager -n 20
+        
+        # Try to restart PgBouncer with more detailed logging
+        log "Attempting to restart PgBouncer with verbose logging"
+        systemctl stop pgbouncer
+        sleep 3
+        sudo -u postgres pgbouncer -v -u postgres -d /etc/pgbouncer/pgbouncer.ini || log "Failed to start PgBouncer manually"
+        sleep 3
+        systemctl start pgbouncer
     fi
 }
 
@@ -753,6 +806,10 @@ setup_monitoring() {
     # Create scripts directory
     mkdir -p /opt/dbhub/scripts
     
+    # Create log directory for scripts
+    mkdir -p /var/log/dbhub
+    chown postgres:postgres /var/log/dbhub
+    
     # Copy monitoring scripts
     cp scripts/server_monitor.sh /opt/dbhub/scripts/
     cp scripts/backup_postgres.sh /opt/dbhub/scripts/
@@ -762,6 +819,11 @@ setup_monitoring() {
     
     # Set permissions
     chmod +x /opt/dbhub/scripts/*.sh
+    chown postgres:postgres /opt/dbhub/scripts/*.sh
+    
+    # Create symbolic links for commonly used scripts
+    ln -sf /opt/dbhub/scripts/db_user_manager.sh /usr/local/bin/db-user
+    ln -sf /opt/dbhub/scripts/update_pgbouncer_users.sh /usr/local/bin/pgbouncer-users
     
     # Set up cron jobs
     log "Setting up cron jobs"
@@ -775,7 +837,7 @@ setup_monitoring() {
     # Add PgBouncer user update cron job (daily at 3 AM)
     (crontab -l 2>/dev/null || echo "") | grep -v "update_pgbouncer_users.sh" | { cat; echo "0 3 * * * /opt/dbhub/scripts/update_pgbouncer_users.sh > /dev/null 2>&1"; } | crontab -
     
-    log "Monitoring setup complete"
+    log "Monitoring setup completed"
 }
 
 # Function to run diagnostics

@@ -62,8 +62,27 @@ A database user management utility that helps create and manage PostgreSQL users
 - Creates new databases with proper ownership
 - Modifies user permissions and attributes
 - Deletes users and their owned objects safely
+- Automatically updates PgBouncer user authentication in real-time
+- Provides password update functionality with immediate PgBouncer sync
+- Includes a manual sync command to force synchronization of all users
+- Reloads PgBouncer configuration without service disruption
 
-This script follows security best practices by limiting user privileges to only what's necessary, helping maintain the principle of least privilege.
+This script follows security best practices by limiting user privileges to only what's necessary, helping maintain the principle of least privilege. It also solves the login delay issue by updating PgBouncer's authentication immediately when users are created, modified, or deleted.
+
+**Usage Examples:**
+```bash
+# Create a new user with access to a specific database
+sudo ./db_user_manager.sh create-user mydb myuser mypassword
+
+# Update a user's password
+sudo ./db_user_manager.sh update-password myuser newpassword
+
+# Delete a user (removes from both PostgreSQL and PgBouncer)
+sudo ./db_user_manager.sh delete-user myuser
+
+# Manually synchronize all PostgreSQL users with PgBouncer
+sudo ./db_user_manager.sh sync-pgbouncer
+```
 
 ### update_pgbouncer_users.sh
 
@@ -76,8 +95,30 @@ A utility script that synchronizes PostgreSQL users with PgBouncer's authenticat
 - Handles different authentication methods
 - Reloads PgBouncer configuration without service disruption
 - Logs all changes for auditing purposes
+- Supports individual user updates (add, update, delete)
+- Integrates with db_user_manager.sh for real-time updates
+- Includes command-line arguments for flexible usage
+- Provides quiet mode for automated/scripted usage
 
-This script is typically scheduled to run daily to ensure PgBouncer's user list stays in sync with PostgreSQL.
+This script is typically scheduled to run daily to ensure PgBouncer's user list stays in sync with PostgreSQL. It can also be called on-demand for individual user updates by the db_user_manager.sh script.
+
+**Usage Examples:**
+```bash
+# Update all PostgreSQL users in PgBouncer
+sudo ./update_pgbouncer_users.sh
+
+# Update a single user
+sudo ./update_pgbouncer_users.sh -u myuser -a add
+
+# Delete a user from PgBouncer
+sudo ./update_pgbouncer_users.sh -u myuser -a delete
+
+# Update all users but skip reloading PgBouncer
+sudo ./update_pgbouncer_users.sh -s
+
+# Quiet mode for scripted usage
+sudo ./update_pgbouncer_users.sh -q -u myuser -a update
+```
 
 ### pg_auto_scale.sh
 
@@ -152,7 +193,8 @@ The main installation script configures PgBouncer to use SCRAM-SHA-256 authentic
 - Matches the PostgreSQL authentication method
 - Uses properly formatted SCRAM password hashes in userlist.txt
 - Automatically adds all database users to PgBouncer with correct auth
-- Prevents "FATAL: password authentication failed" errors
+- Implements auth_query for proper SASL authentication
+- Prevents "FATAL: password authentication failed" and "FATAL: SASL authentication failed" errors
 
 The script also handles upgrading existing installations:
 - Detects when an existing PgBouncer installation uses MD5 authentication
