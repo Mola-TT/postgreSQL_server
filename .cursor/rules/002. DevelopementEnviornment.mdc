@@ -1,0 +1,18 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Guidelines:
+1. **Development Environment**
+   - The script is developed on a Windows machine.
+   - The script is not executed on Windows but will run on an Ubuntu server.
+   - Use WSL (if needed) for compatibility checks.
+
+2. **GitHub Workflow**
+   - Each commit should contain only **one function change**.
+   - Every commit must have a clear and concise message describing the function change.
+   - After making changes, the script should be **automatically pushed to GitHub**.
+
+3. **Automatic Git Commit & Push Script**
+   - Use a PowerShell to handle commits and push changes to GitHub.
