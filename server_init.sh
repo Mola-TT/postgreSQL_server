@@ -521,9 +521,19 @@ configure_pgbouncer() {
     # Function to get SCRAM hash for PostgreSQL user
     get_user_hash() {
         local username="$1"
+        
         # Use PGPASSWORD to avoid prompts and connect directly as postgres
         if [ -n "$PG_PASSWORD" ]; then
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" | xargs
+            local hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
+            
+            # Check if we got a valid hash
+            if [ -z "$hash" ] || [[ "$hash" != SCRAM-SHA-256* ]]; then
+                log "WARNING: Failed to get SCRAM hash for user $username. Using plain password as fallback."
+                echo "$PG_PASSWORD"
+                return 1
+            fi
+            
+            echo "$hash"
         else
             log "WARNING: PG_PASSWORD not set, cannot generate hash for $username"
             return 1
@@ -564,7 +574,7 @@ logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
 listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
-auth_type = scram-sha-256,plain
+auth_type = scram-sha-256,plain,md5
 auth_file = /etc/pgbouncer/userlist.txt
 auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=\$1
 auth_user = postgres
@@ -590,6 +600,17 @@ client_tls_key_file = /etc/postgresql/ssl/server.key
 client_tls_cert_file = /etc/postgresql/ssl/server.crt
 EOF
     
+    # Create log directory for PgBouncer if it doesn't exist
+    log "Ensuring PgBouncer log directory exists"
+    mkdir -p /var/log/postgresql
+    touch /var/log/postgresql/pgbouncer.log
+    chown postgres:postgres /var/log/postgresql/pgbouncer.log
+    
+    # Create run directory for PgBouncer if it doesn't exist
+    log "Ensuring PgBouncer run directory exists"
+    mkdir -p /var/run/postgresql
+    chown postgres:postgres /var/run/postgresql
+    
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
     log "PgBouncer authentication set to scram-sha-256 to match PostgreSQL"
@@ -597,11 +618,18 @@ EOF
     log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
     # Generate PostgreSQL SCRAM-SHA-256 hash for postgres user
+    log "Creating new PgBouncer userlist with SCRAM-SHA-256 hashes"
     POSTGRES_PASSWORD_HASH=$(get_user_hash "postgres")
     
-    # Create new userlist.txt with proper SCRAM-SHA-256 hash
-    log "Creating new PgBouncer userlist with SCRAM-SHA-256 hashes"
-    echo "\"postgres\" \"$POSTGRES_PASSWORD_HASH\"" > "/etc/pgbouncer/userlist.txt"
+    # Check if hash generation was successful
+    if [[ "$POSTGRES_PASSWORD_HASH" == SCRAM-SHA-256* ]]; then
+        log "Successfully generated SCRAM hash for postgres user"
+        echo "\"postgres\" \"$POSTGRES_PASSWORD_HASH\"" > "/etc/pgbouncer/userlist.txt"
+    else
+        log "WARNING: Failed to generate SCRAM hash. Using plain text password as fallback."
+        # Use plain text password as fallback (less secure but more compatible)
+        echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
+    fi
     
     # Add demo user if exists
     if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ]; then
@@ -620,6 +648,14 @@ EOF
     chown postgres:postgres /etc/pgbouncer/userlist.txt
     chmod 640 /etc/pgbouncer/pgbouncer.ini
     chmod 640 /etc/pgbouncer/userlist.txt
+    
+    # Verify userlist.txt is not empty
+    if [ ! -s "/etc/pgbouncer/userlist.txt" ]; then
+        log "WARNING: PgBouncer userlist.txt is empty. Creating with plain text password as fallback."
+        echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
+        chown postgres:postgres /etc/pgbouncer/userlist.txt
+        chmod 640 /etc/pgbouncer/userlist.txt
+    fi
     
     log "PgBouncer configuration complete"
     
@@ -642,65 +678,37 @@ EOF
     
     # Restart PgBouncer to apply changes
     log "Restarting PgBouncer"
-    systemctl restart pgbouncer
-    
-    # Verify PgBouncer is running
-    if systemctl is-active --quiet pgbouncer; then
-        log "PgBouncer successfully restarted"
+    if ! systemctl restart pgbouncer; then
+        log "ERROR: PgBouncer failed to restart with systemctl. Checking logs..."
         
-        # Log the current PostgreSQL password we're working with
-        log "Using PostgreSQL password (masked): ${PG_PASSWORD:0:3}****"
+        # Display more detailed diagnostics
+        log "PgBouncer service status:"
+        systemctl status pgbouncer || true
         
-        # Log the PgBouncer userlist for debugging
-        log "PgBouncer userlist content (no passwords):"
-        grep -o '"[^"]*"' /etc/pgbouncer/userlist.txt | head -n 3 | grep -v "\$" || log "Could not read userlist patterns"
+        log "PgBouncer config and permissions:"
+        ls -la /etc/pgbouncer/ || true
         
-        # Verify PgBouncer configuration and connectivity
-        log "Testing PgBouncer connectivity"
-        # First try with psql (if available to the user)
-        if PGPASSWORD="$PG_PASSWORD" psql -h localhost -p 6432 -U postgres -c "SELECT version();" > /dev/null 2>&1; then
-            log "PgBouncer connectivity test successful (using psql directly)"
-        # Fallback to using sudo if necessary
-        elif PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -h localhost -p 6432 -c "SELECT version();" > /dev/null 2>&1; then
-            log "PgBouncer connectivity test successful (using sudo)"
-        else
-            log "WARNING: Could not connect to PgBouncer on port 6432"
-            log "Checking PgBouncer logs for errors:"
-            tail -n 20 /var/log/postgresql/pgbouncer.log || log "Could not read PgBouncer logs"
-            
-            # Additional debugging steps
-            log "Additional debugging info for PgBouncer:"
-            log "1. Showing PgBouncer service status:"
-            systemctl status pgbouncer || log "Could not get PgBouncer service status"
-            
-            log "2. Verifying PgBouncer userlist contents:"
-            grep -o '"[^"]*"' /etc/pgbouncer/userlist.txt | head -n 3 | grep -v "\$" || log "Could not read userlist patterns"
-
-            log "3. Test direct PostgreSQL connection:"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -p 5432 -U postgres -c "SELECT 'Direct PostgreSQL connection successful';" || 
-            PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -h localhost -p 5432 -c "SELECT 'Direct PostgreSQL connection with sudo successful';" || 
-            log "Direct PostgreSQL connection failed"
-            
-            log "4. Adding postgres user explicitly to userlist.txt with clear text password as fallback:"
-            echo "\"postgres\" \"$PG_PASSWORD\"" >> /etc/pgbouncer/userlist.txt
-            chown postgres:postgres /etc/pgbouncer/userlist.txt
-            chmod 640 /etc/pgbouncer/userlist.txt
-            log "Restarting PgBouncer with fallback authentication"
-            systemctl restart pgbouncer
-            sleep 3
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -p 6432 -U postgres -c "SELECT 'Fallback connection successful';" || log "Fallback connection failed"
-        fi
+        log "PgBouncer log file:"
+        ls -la /var/log/postgresql/pgbouncer.log || true
+        cat /var/log/postgresql/pgbouncer.log 2>/dev/null || true
+        
+        log "Checking systemd journal for PgBouncer errors:"
+        journalctl -u pgbouncer --no-pager -n 20 || true
+        
+        # Try starting manually with verbose output
+        log "Attempting to start PgBouncer manually with verbose logging"
+        systemctl stop pgbouncer || true
+        sleep 3
+        
+        # Try running PgBouncer directly with verbose output
+        log "Running PgBouncer directly for debugging:"
+        sudo -u postgres pgbouncer -v -d -u postgres /etc/pgbouncer/pgbouncer.ini || true
+        
+        # Try restarting with service again after logging
+        log "Attempting to restart PgBouncer service again"
+        systemctl restart pgbouncer || log "PgBouncer restart failed again. Please check configuration manually."
     else
-        log "ERROR: PgBouncer failed to restart. Checking logs..."
-        journalctl -u pgbouncer --no-pager -n 20
-        
-        # Try to restart PgBouncer with more detailed logging
-        log "Attempting to restart PgBouncer with verbose logging"
-        systemctl stop pgbouncer
-        sleep 3
-        sudo -u postgres pgbouncer -v -u postgres -d /etc/pgbouncer/pgbouncer.ini || log "Failed to start PgBouncer manually"
-        sleep 3
-        systemctl start pgbouncer
+        log "PgBouncer successfully restarted"
     fi
 }
 
