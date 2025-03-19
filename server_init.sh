@@ -877,7 +877,7 @@ create_demo_database() {
         
         # Now drop the user
         log "Dropping user $user_name"
-        if ! PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;" 2>/dev/null; then
+        if ! PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" 2>/dev/null; then
             log "WARNING: Could not drop user with standard method, trying more aggressive approach"
             
             # Find and drop remaining dependencies in all databases
@@ -909,18 +909,39 @@ create_demo_database() {
             
             # Try again after aggressive cleanup
             log "Trying to drop user again after cleanup"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;" || {
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" || {
                 log "ERROR: Still could not drop user. Will continue with creating a new database."
                 # Force drop and recreate the database as last resort
                 log "Force dropping and recreating the demo database as last resort"
                 # First terminate connections
                 PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';" || true
                 
-                # Drop database with FORCE option (outside transaction, requires PostgreSQL 13+)
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE IF EXISTS $db_name WITH (FORCE);" || {
-                    # Alternative approach with dropdb command-line utility if psql fails
-                    log "Trying alternative approach to drop database"
-                    PGPASSWORD="$PG_PASSWORD" dropdb -h localhost -U postgres --if-exists "$db_name" || true
+                # Force drop database - without WITH (FORCE) which might not be supported in all versions
+                # Use separate commands to avoid transaction blocks
+                log "Attempting to drop database forcefully"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "UPDATE pg_database SET datallowconn = 'false' WHERE datname = '$db_name';" || true
+                sleep 1
+                
+                # Terminate existing connections more aggressively
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
+                    SELECT pg_terminate_backend(pg_stat_activity.pid)
+                    FROM pg_stat_activity
+                    WHERE pg_stat_activity.datname = '$db_name'
+                    AND pid <> pg_backend_pid();
+                " || true
+                sleep 2
+                
+                # Now try to drop the database (should be no connections)
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE $db_name;" || {
+                    # If that fails, try using dropdb command
+                    log "Using dropdb utility as fallback"
+                    PGPASSWORD="$PG_PASSWORD" dropdb -h localhost -U postgres --if-exists "$db_name" || {
+                        # Final desperate measure - rename the database
+                        log "WARNING: Could not drop the database, renaming it instead"
+                        new_db_name="${db_name}_old_$(date +%s)"
+                        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true
+                        db_name="${DEMO_DB_NAME:-demo}"  # Reset to original name
+                    }
                 }
             }
         fi
@@ -943,7 +964,8 @@ create_demo_database() {
         log "Demo user STILL exists after cleanup attempts. Using final aggressive approach."
         # Try to drop any remaining dependencies and the user with CASCADE
         PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;" || true
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER $user_name CASCADE;" || true
+        # The correct syntax for DROP USER in PostgreSQL doesn't include CASCADE (use DROP ROLE for CASCADE)
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE $user_name;" || true
         # Last resort - if we still can't drop the user, create a new user with a timestamp
         if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
             log "WARNING: Could not drop demo user. Creating new user with timestamp suffix."
@@ -1053,11 +1075,45 @@ create_demo_database() {
         # Remove existing demo database entry if exists
         sed -i "/^$db_name = /d" /etc/pgbouncer/pgbouncer.ini
         
-        # Add specific entry for demo database with maintenance_db parameter
-        sed -i "/\[databases\]/a $db_name = host=localhost port=5432 dbname=$db_name user=$user_name password=$password maintenance_db=$db_name" /etc/pgbouncer/pgbouncer.ini
+        # Add specific entry for demo database WITHOUT maintenance_db parameter (it's not supported by PgBouncer)
+        sed -i "/\[databases\]/a $db_name = host=localhost port=5432 dbname=$db_name user=$user_name password=$password" /etc/pgbouncer/pgbouncer.ini
         
-        # Restart PgBouncer to apply changes
-        systemctl restart pgbouncer
+        # IMPORTANT: Fix any existing broken configurations before restart
+        if grep -q "maintenance_db" /etc/pgbouncer/pgbouncer.ini; then
+            log "Found unsupported maintenance_db parameter in PgBouncer configuration - removing it"
+            sed -i '/maintenance_db/d' /etc/pgbouncer/pgbouncer.ini
+        fi
+        
+        # Restart PgBouncer to apply changes - with more robust error handling
+        log "Restarting PgBouncer with updated configuration"
+        if ! systemctl restart pgbouncer; then
+            log "WARNING: PgBouncer restart failed, checking configuration"
+            
+            # Display more detailed diagnostics
+            log "PgBouncer service status:"
+            systemctl status pgbouncer || true
+            
+            log "PgBouncer config and permissions:"
+            ls -la /etc/pgbouncer/ || true
+            
+            log "PgBouncer configuration contents:"
+            cat /etc/pgbouncer/pgbouncer.ini || true
+            
+            log "PgBouncer log file:"
+            cat /var/log/postgresql/pgbouncer.log 2>/dev/null || true
+            
+            # Check the configuration specifically for unsupported parameters
+            if grep -q "maintenance_db" /etc/pgbouncer/pgbouncer.ini; then
+                log "Removing unsupported maintenance_db parameter from PgBouncer configuration"
+                sed -i '/maintenance_db/d' /etc/pgbouncer/pgbouncer.ini
+            fi
+            
+            # Try to restart PgBouncer with the fixed configuration
+            log "Attempting to restart PgBouncer with fixed configuration"
+            systemctl restart pgbouncer || log "WARNING: PgBouncer restart failed again, please check logs manually"
+        else
+            log "PgBouncer successfully restarted with updated configuration"
+        fi
     fi
     
     log "Demo database and user created with strict isolation"
