@@ -828,7 +828,88 @@ create_demo_database() {
         # Drop the database-specific role if it exists
         if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$role_name'" 2>/dev/null)" = "1" ]; then
             log "Dropping database-specific role: $role_name"
+            
+            # First handle dependencies by reassigning ownership of all objects owned by the role
+            if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
+                log "Checking for objects owned by $role_name in $db_name database"
+                
+                # Reassign database ownership first if needed
+                if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name' AND datdba=(SELECT oid FROM pg_roles WHERE rolname='$role_name')" 2>/dev/null)" = "1" ]; then
+                    log "Reassigning database ownership from $role_name to postgres"
+                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
+                fi
+                
+                # Find and reassign ownership of schemas, tables, functions, etc.
+                log "Reassigning ownership of all objects owned by $role_name to postgres"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
+-- Reassign all objects owned by role to postgres
+DO \$\$
+DECLARE
+    obj record;
+BEGIN
+    -- Reassign schema ownership
+    FOR obj IN SELECT nspname FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
+    LOOP
+        EXECUTE format('ALTER SCHEMA %I OWNER TO postgres', obj.nspname);
+        RAISE NOTICE 'Changed ownership of schema % to postgres', obj.nspname;
+    END LOOP;
+    
+    -- Reassign table ownership
+    FOR obj IN SELECT schemaname, tablename FROM pg_tables WHERE tableowner = '$role_name'
+    LOOP
+        EXECUTE format('ALTER TABLE %I.%I OWNER TO postgres', obj.schemaname, obj.tablename);
+        RAISE NOTICE 'Changed ownership of table %.% to postgres', obj.schemaname, obj.tablename;
+    END LOOP;
+    
+    -- Reassign view ownership
+    FOR obj IN SELECT schemaname, viewname FROM pg_views WHERE viewowner = '$role_name'
+    LOOP
+        EXECUTE format('ALTER VIEW %I.%I OWNER TO postgres', obj.schemaname, obj.viewname);
+        RAISE NOTICE 'Changed ownership of view %.% to postgres', obj.schemaname, obj.viewname;
+    END LOOP;
+    
+    -- Reassign function ownership
+    FOR obj IN SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) AS args
+        FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE p.proowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
+    LOOP
+        EXECUTE format('ALTER FUNCTION %I.%I(%s) OWNER TO postgres', 
+                      obj.nspname, obj.proname, obj.args);
+        RAISE NOTICE 'Changed ownership of function %.%(%s) to postgres', 
+                    obj.nspname, obj.proname, obj.args;
+    END LOOP;
+    
+    -- Reassign sequence ownership
+    FOR obj IN SELECT n.nspname, c.relname
+        FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+        WHERE c.relkind = 'S' AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
+    LOOP
+        EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO postgres', obj.nspname, obj.relname);
+        RAISE NOTICE 'Changed ownership of sequence %.% to postgres', obj.nspname, obj.relname;
+    END LOOP;
+    
+    -- Reassign type ownership
+    FOR obj IN SELECT n.nspname, t.typname
+        FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
+        WHERE t.typowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
+    LOOP
+        EXECUTE format('ALTER TYPE %I.%I OWNER TO postgres', obj.nspname, obj.typname);
+        RAISE NOTICE 'Changed ownership of type %.% to postgres', obj.nspname, obj.typname;
+    END LOOP;
+END
+\$\$;
+EOF
+            fi
+            
+            # Now try to drop the role
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
+            
+            # If it still fails, force drop owned objects
+            if [ $? -ne 0 ]; then
+                log "Still unable to drop role due to dependencies. Trying DROP OWNED..."
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP OWNED BY $role_name CASCADE;"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
+            fi
         fi
         
         # Check if role owns any objects in the demo database and reassign them to postgres
