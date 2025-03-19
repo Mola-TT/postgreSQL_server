@@ -807,6 +807,68 @@ create_demo_database() {
         if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
             log "Reassigning owned objects in $db_name database to postgres"
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;" || true
+            
+            # Additional cleanup for problematic objects
+            log "Performing additional object cleanup in $db_name database"
+            
+            # Drop default privileges that may be left behind
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES FOR ROLE $user_name REVOKE ALL ON TABLES FROM $user_name;" || true
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES FOR ROLE $user_name REVOKE ALL ON SEQUENCES FROM $user_name;" || true
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES FOR ROLE $user_name REVOKE ALL ON FUNCTIONS FROM $user_name;" || true
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES FOR ROLE $user_name REVOKE ALL ON TYPES FROM $user_name;" || true
+            
+            # Find and change ownership of any problematic objects
+            log "Finding and fixing remaining dependent objects"
+            
+            # Find and handle roles/memberships
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "
+            DO \$\$
+            DECLARE
+                obj record;
+                cmd text;
+            BEGIN
+                -- Drop any roles created by the user
+                FOR obj IN SELECT rolname FROM pg_roles WHERE rolname LIKE '${user_name}_%' LOOP
+                    EXECUTE 'DROP ROLE IF EXISTS ' || quote_ident(obj.rolname);
+                END LOOP;
+                
+                -- Find and drop any remaining objects owned by the user
+                FOR obj IN 
+                    SELECT schemaname, tablename as objname, 'TABLE' as objtype FROM pg_tables WHERE tableowner = '${user_name}'
+                    UNION ALL
+                    SELECT schemaname, viewname as objname, 'VIEW' as objtype FROM pg_views WHERE viewowner = '${user_name}'
+                    UNION ALL
+                    SELECT schemaname, matviewname as objname, 'MATERIALIZED VIEW' as objtype FROM pg_matviews WHERE matviewowner = '${user_name}'
+                    UNION ALL
+                    SELECT nspname as schemaname, relname as objname, 'SEQUENCE' as objtype FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE relkind = 'S' AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = '${user_name}')
+                    UNION ALL
+                    SELECT nspname as schemaname, proname as objname, 'FUNCTION' as objtype FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
+                    WHERE p.proowner = (SELECT oid FROM pg_roles WHERE rolname = '${user_name}')
+                LOOP
+                    cmd := 'ALTER ' || obj.objtype || ' ' || quote_ident(obj.schemaname) || '.' || quote_ident(obj.objname) || ' OWNER TO postgres';
+                    EXECUTE cmd;
+                END LOOP;
+            END;
+            \$\$;" || true
+            
+            # Handle any remaining functions or procedural language objects
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "
+            DO \$\$
+            DECLARE
+                obj record;
+            BEGIN
+                -- Find and transfer ownership of any functions
+                FOR obj IN SELECT p.oid, p.proname, n.nspname
+                          FROM pg_proc p
+                          JOIN pg_namespace n ON p.pronamespace = n.oid
+                          WHERE p.proowner = (SELECT oid FROM pg_roles WHERE rolname = '${user_name}')
+                LOOP
+                    EXECUTE 'ALTER FUNCTION ' || quote_ident(obj.nspname) || '.' || quote_ident(obj.proname) || '(' ||
+                            pg_get_function_identity_arguments(obj.oid) || ') OWNER TO postgres';
+                END LOOP;
+            END;
+            \$\$;" || true
         fi
         
         # Drop owned by user in postgres database
@@ -815,7 +877,48 @@ create_demo_database() {
         
         # Now drop the user
         log "Dropping user $user_name"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;"
+        if ! PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;" 2>/dev/null; then
+            log "WARNING: Could not drop user with standard method, trying more aggressive approach"
+            
+            # Find and drop remaining dependencies in all databases
+            log "Scanning all databases for remaining dependencies"
+            for db in $(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0', 'template1') AND datistemplate = false;"); do
+                log "Checking database: $db"
+                
+                # If this is the demo database, try drastic measures - drop schemas owned by the user
+                if [ "$db" = "$db_name" ]; then
+                    log "Taking drastic measures in demo database"
+                    # Drop any remaining dependent objects forcefully
+                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "
+                    DO \$\$
+                    DECLARE
+                        obj record;
+                    BEGIN
+                        -- Force drop any dependent objects
+                        FOR obj IN SELECT relname FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '${user_name}') LOOP
+                            BEGIN
+                                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(obj.relname) || ' CASCADE';
+                            EXCEPTION WHEN OTHERS THEN
+                                -- Ignore errors and continue
+                            END;
+                        END LOOP;
+                    END;
+                    \$\$;" || true
+                fi
+            done
+            
+            # Try again after aggressive cleanup
+            log "Trying to drop user again after cleanup"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;" || {
+                log "ERROR: Still could not drop user. Will continue with creating a new database."
+                # Force drop and recreate the database as last resort
+                log "Force dropping and recreating the demo database as last resort"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
+                    SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';
+                    DROP DATABASE IF EXISTS $db_name;
+                " || true
+            }
+        fi
     fi
     
     # Create demo database (make sure it's owned by postgres initially)
