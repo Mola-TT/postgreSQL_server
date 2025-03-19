@@ -45,12 +45,14 @@ LOG_DIR="/var/log/dbhub"
 LOG_FILE="$LOG_DIR/server_init.log"
 
 # Ensure log directory exists
-mkdir -p "$LOG_DIR"
-touch "$LOG_FILE"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
 
 # Logging function
 log() {
-    echo "[$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    local timestamp=$(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $1"
+    echo "[$timestamp] $1" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # Function to check if a command exists
@@ -1235,8 +1237,59 @@ get_postgres_result() {
     fi
 }
 
+# Function to clear logs before initialization
+clear_logs() {
+    log "Starting log cleanup process"
+    
+    # Clear PostgreSQL log files
+    log "Clearing PostgreSQL logs..."
+    if [ -d "/var/log/postgresql" ]; then
+        rm -f /var/log/postgresql/pgbouncer.log
+        rm -f /var/log/postgresql/postgresql-*-main.log
+        touch /var/log/postgresql/pgbouncer.log
+        if getent passwd postgres > /dev/null; then
+            chown postgres:postgres /var/log/postgresql/pgbouncer.log
+            chmod 640 /var/log/postgresql/pgbouncer.log
+        fi
+        log "PostgreSQL logs cleared"
+    else
+        log "PostgreSQL log directory not found, will be created during installation"
+    fi
+
+    # Clear DBHub logs
+    log "Clearing DBHub logs..."
+    if [ -d "/var/log/dbhub" ]; then
+        rm -f /var/log/dbhub/server_init.log
+        rm -f /var/log/dbhub/*.log
+        touch "$LOG_FILE"  # Recreate the current log file
+        log "DBHub logs cleared"
+    else
+        log "DBHub log directory created (was not present)"
+    fi
+
+    # Clear systemd journal logs for PostgreSQL and PgBouncer
+    log "Clearing journal logs for PostgreSQL and PgBouncer..."
+    if command_exists journalctl; then
+        journalctl --vacuum-time=1s --unit=postgresql 2>/dev/null || log "No PostgreSQL journal logs found"
+        journalctl --vacuum-time=1s --unit=pgbouncer 2>/dev/null || log "No PgBouncer journal logs found"
+        log "Journal logs cleared"
+    else
+        log "journalctl not available, skipping journal cleanup"
+    fi
+
+    # Clear any connection info files
+    log "Clearing connection info files..."
+    rm -f connection_info.txt
+    log "Connection info files cleared"
+    
+    log "Log cleanup process completed"
+}
+
 # Main function
 main() {
+    # Clear logs first
+    clear_logs
+    
     log "Starting server initialization"
     
     # Make all modules and scripts executable
