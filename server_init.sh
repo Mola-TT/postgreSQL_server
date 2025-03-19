@@ -525,20 +525,20 @@ configure_pgbouncer() {
     get_user_hash() {
         local username="$1"
         
-        # First try using peer authentication to avoid password authentication issues
-        local hash=$(sudo -u postgres psql -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
-        
-        # Check if we got a valid hash with peer auth
-        if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
-            echo "$hash"
-            return 0
-        fi
-        
-        # Fallback to using PGPASSWORD if peer auth didn't work
+        # Try using PGPASSWORD to avoid password prompts
         if [ -n "$PG_PASSWORD" ]; then
-            hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
+            local hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
             
             # Check if we got a valid hash
+            if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
+                echo "$hash"
+                return 0
+            fi
+            
+            # If the above failed, try the peer auth method as fallback
+            hash=$(sudo -u postgres psql -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
+            
+            # Check if we got a valid hash with peer auth
             if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
                 echo "$hash"
                 return 0
@@ -584,7 +584,7 @@ logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
 listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
-auth_type = scram-sha-256,plain,md5
+auth_type = scram-sha-256
 auth_file = /etc/pgbouncer/userlist.txt
 auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=\$1
 auth_user = postgres
@@ -672,13 +672,13 @@ EOF
     # Verify the auth_query setup
     log "Verifying PostgreSQL permissions for auth_query"
     
-    # Check permissions using peer authentication to avoid password issues
-    has_permission=$(sudo -u postgres psql -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')")
+    # Check permissions using PGPASSWORD to avoid password issues
+    has_permission=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')" 2>/dev/null)
     
     if [ "$has_permission" != "t" ]; then
         log "WARNING: postgres user does not have SELECT permission on pg_shadow."
         log "Granting necessary permissions for auth_query"
-        sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
     else
         log "postgres user has proper permissions for auth_query"
     fi
@@ -811,8 +811,8 @@ create_demo_database() {
     
     # Create demo database
     log "Creating demo database"
-    if [ "$(get_postgres_result "SELECT 1 FROM pg_database WHERE datname='$db_name'")" != "1" ]; then
-        sudo -u postgres psql -c "CREATE DATABASE $db_name"
+    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" != "1" ]; then
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE DATABASE $db_name"
         log "Demo database created"
     else
         log "Demo database already exists"
@@ -820,16 +820,16 @@ create_demo_database() {
     
     # Create demo user
     log "Creating demo user"
-    if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='$user_name'")" != "1" ]; then
-        sudo -u postgres psql -c "CREATE USER $user_name WITH PASSWORD '$password'"
+    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" != "1" ]; then
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE USER $user_name WITH PASSWORD '$password'"
         log "Demo user created"
     else
-        sudo -u postgres psql -c "ALTER USER $user_name WITH PASSWORD '$password'"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER $user_name WITH PASSWORD '$password'"
         log "Demo user password updated"
     fi
     
     # Grant privileges
-    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name"
     log "Privileges granted to demo user"
     
     log "Demo database and user created"
