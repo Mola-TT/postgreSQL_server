@@ -141,7 +141,7 @@ fix_postgresql_startup() {
     
     # Wait a bit and check if it's running
     sleep 10
-    if sudo -u postgres pg_isready -q; then
+    if pg_isready -h localhost -q; then
         log "PostgreSQL started successfully with manual start"
         return 0
     else
@@ -158,13 +158,17 @@ wait_for_postgresql() {
     log "Waiting for PostgreSQL to be ready..."
     
     while [ $attempt -le $max_attempts ]; do
-        if PGPASSWORD="$PG_PASSWORD" sudo -u postgres pg_isready -q 2>/dev/null; then
-            log "PostgreSQL is ready"
-            return 0
-        elif sudo -u postgres pg_isready -q; then
-            # Also try without PGPASSWORD in case pg_isready doesn't need it
-            log "PostgreSQL is ready"
-            return 0
+        if [ -n "$PG_PASSWORD" ]; then
+            if PGPASSWORD="$PG_PASSWORD" pg_isready -h localhost -U postgres -q 2>/dev/null; then
+                log "PostgreSQL is ready"
+                return 0
+            fi
+        else
+            # If PG_PASSWORD is not set, try without it
+            if pg_isready -h localhost -q; then
+                log "PostgreSQL is ready"
+                return 0
+            fi
         fi
         
         log "PostgreSQL not ready yet (attempt $attempt/$max_attempts). Waiting..."
@@ -417,7 +421,7 @@ EOF
     log "Waiting for PostgreSQL to be ready..."
     attempt=1
     max_attempts=30
-    while ! sudo -u postgres pg_isready -q; do
+    while ! pg_isready -h localhost -q; do
         if [ $attempt -ge $max_attempts ]; then
             log "ERROR: PostgreSQL did not become ready after $max_attempts attempts"
             return 1
@@ -442,17 +446,25 @@ EOF
         systemctl restart postgresql
         sleep 3
         log "PostgreSQL restarted with updated authentication configuration"
+        
+        # Grant postgres user access to pg_shadow for PgBouncer auth_query
+        log "Granting postgres user access to pg_shadow for PgBouncer SASL authentication"
+        if [ -n "$PG_PASSWORD" ]; then
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
+        else
+            log "WARNING: PG_PASSWORD not set, skipping access grant"
+        fi
+        
+        # Revoke public schema privileges
+        log "Revoking public schema privileges"
+        if [ -n "$PG_PASSWORD" ]; then
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+        else
+            log "WARNING: PG_PASSWORD not set, skipping privilege revocation"
+        fi
     else
         log "WARNING: PG_PASSWORD not set. Skipping password configuration."
     fi
-    
-    # Grant postgres user access to pg_shadow for PgBouncer auth_query
-    log "Granting postgres user access to pg_shadow for PgBouncer SASL authentication"
-    run_postgres_command "ALTER USER postgres WITH SUPERUSER;"
-    
-    # Revoke public schema privileges
-    log "Revoking public schema privileges"
-    run_postgres_command "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
     
     log "PostgreSQL configuration complete"
     return 0
@@ -509,13 +521,22 @@ configure_pgbouncer() {
     # Function to get SCRAM hash for PostgreSQL user
     get_user_hash() {
         local username="$1"
-        # Use our helper function to get the hash without password prompt
-        get_postgres_result "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" | xargs
+        # Use PGPASSWORD to avoid prompts and connect directly as postgres
+        if [ -n "$PG_PASSWORD" ]; then
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" | xargs
+        else
+            log "WARNING: PG_PASSWORD not set, cannot generate hash for $username"
+            return 1
+        fi
     }
     
     # Ensure postgres user has access to pg_shadow for auth_query
     log "Ensuring postgres user has appropriate permissions for auth_query"
-    run_postgres_command "ALTER USER postgres WITH SUPERUSER;"
+    if [ -n "$PG_PASSWORD" ]; then
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
+    else
+        log "WARNING: PG_PASSWORD not set, cannot ensure permissions"
+    fi
     
     # Create a backup of PgBouncer configuration if it exists
     if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
@@ -604,12 +625,19 @@ EOF
     
     # Verify the auth_query setup
     log "Verifying PostgreSQL permissions for auth_query"
-    if [ "$(get_postgres_result "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')")" != "t" ]; then
-        log "WARNING: postgres user does not have SELECT permission on pg_shadow."
-        log "Granting necessary permissions for auth_query"
-        run_postgres_command "ALTER USER postgres WITH SUPERUSER;"
+    if [ -n "$PG_PASSWORD" ]; then
+        # Check permissions using PGPASSWORD to avoid prompts
+        has_permission=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')")
+        
+        if [ "$has_permission" != "t" ]; then
+            log "WARNING: postgres user does not have SELECT permission on pg_shadow."
+            log "Granting necessary permissions for auth_query"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
+        else
+            log "postgres user has proper permissions for auth_query"
+        fi
     else
-        log "postgres user has proper permissions for auth_query"
+        log "WARNING: PG_PASSWORD not set, cannot verify permissions"
     fi
     
     # Restart PgBouncer to apply changes
@@ -878,9 +906,16 @@ run_diagnostics() {
     check_postgresql_logs
     
     # If PostgreSQL is not running, try to fix it
-    if ! sudo -u postgres pg_isready -q; then
-        log "Attempting to fix PostgreSQL cluster..."
+    if ! pg_isready -h localhost -q; then
+        log "PostgreSQL is not running properly. Attempting to fix..."
         fix_postgresql_cluster
+        
+        # Check again after fix attempt
+        if ! pg_isready -h localhost -q; then
+            log "ERROR: PostgreSQL is still not running properly after fix attempts"
+            log "Please check the logs and run the diagnostics command for more information"
+            exit 1
+        fi
     fi
 }
 
@@ -1124,20 +1159,23 @@ run_postgres_command() {
     local command="$1"
     local db_name="${2:-postgres}"  # Default to postgres database
     
-    # Try running with PGPASSWORD
+    # Only try running with PGPASSWORD, never fall back to prompting
     if [ -n "$PG_PASSWORD" ]; then
         PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "$command" 2>/dev/null
         local result=$?
         
-        # If command successful, return
         if [ $result -eq 0 ]; then
             return 0
+        else
+            log "ERROR: Failed to execute PostgreSQL command with PGPASSWORD"
+            log "Command was: $command"
+            return $result
         fi
+    else
+        log "ERROR: PG_PASSWORD not set, cannot execute PostgreSQL command"
+        log "Command was: $command"
+        return 1
     fi
-    
-    # Otherwise fall back to direct command (may prompt for password)
-    psql -h localhost -U postgres -d "$db_name" -c "$command"
-    return $?
 }
 
 # Function to get query result from postgres
@@ -1145,21 +1183,24 @@ get_postgres_result() {
     local query="$1"
     local db_name="${2:-postgres}"  # Default to postgres database
     
-    # Try running with PGPASSWORD
+    # Only try running with PGPASSWORD, never fall back to prompting
     if [ -n "$PG_PASSWORD" ]; then
         local result=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -tAc "$query" 2>/dev/null)
         local exit_code=$?
         
-        # If command successful, return result
         if [ $exit_code -eq 0 ]; then
             echo "$result"
             return 0
+        else
+            log "ERROR: Failed to execute PostgreSQL query with PGPASSWORD"
+            log "Query was: $query"
+            return $exit_code
         fi
+    else
+        log "ERROR: PG_PASSWORD not set, cannot execute PostgreSQL query"
+        log "Query was: $query"
+        return 1
     fi
-    
-    # Otherwise fall back to direct command (may prompt for password)
-    psql -h localhost -U postgres -d "$db_name" -tAc "$query"
-    return $?
 }
 
 # Main function
@@ -1187,12 +1228,12 @@ main() {
     install_postgresql
     
     # Check if PostgreSQL is running properly
-    if ! sudo -u postgres pg_isready -q; then
+    if ! pg_isready -h localhost -q; then
         log "PostgreSQL is not running properly. Attempting to fix..."
         fix_postgresql_cluster
         
         # Check again after fix attempt
-        if ! sudo -u postgres pg_isready -q; then
+        if ! pg_isready -h localhost -q; then
             log "ERROR: PostgreSQL is still not running properly after fix attempts"
             log "Please check the logs and run the diagnostics command for more information"
             exit 1
