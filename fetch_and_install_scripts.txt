@@ -2,6 +2,7 @@ Fresh install
 git clone https://github.com/Mola-TT/postgreSQL_server.git
 cd postgreSQL_server
 chmod +x server_init.sh
+clear
 sudo ./server_init.sh install
 
 
@@ -9,4 +10,5 @@ Pull from remote regardless of changes
 git fetch origin
 git reset --hard origin/main
 chmod +x server_init.sh
+clear
 sudo ./server_init.sh install
