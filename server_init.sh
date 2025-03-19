@@ -499,26 +499,30 @@ configure_pgbouncer() {
         log "Creating PostgreSQL SSL directory"
         mkdir -p "$SSL_DIR"
         
-        # Create self-signed SSL certificate if it doesn't exist
-        if [ ! -f "$SSL_DIR/server.crt" ] || [ ! -f "$SSL_DIR/server.key" ]; then
-            log "Generating self-signed SSL certificate for PgBouncer"
-            apt-get install -y openssl
-            
-            openssl req -new -x509 -days "${SSL_CERT_VALIDITY:-365}" -nodes \
-                -out "$SSL_DIR/server.crt" \
-                -keyout "$SSL_DIR/server.key" \
-                -subj "/C=${SSL_COUNTRY:-US}/ST=${SSL_STATE:-State}/L=${SSL_LOCALITY:-City}/O=${SSL_ORGANIZATION:-Organization}/CN=${SSL_COMMON_NAME:-localhost}"
-            
-            chmod 640 "$SSL_DIR/server.key"
-            chmod 644 "$SSL_DIR/server.crt"
-            chown postgres:postgres "$SSL_DIR/server.key" "$SSL_DIR/server.crt"
-            
-            log "Self-signed SSL certificate generated"
-        else
-            log "SSL certificates already exist"
-        fi
+        # Set appropriate permissions
+        chown postgres:postgres "$SSL_DIR"
+        chmod 700 "$SSL_DIR"
     else
         log "PostgreSQL SSL directory already exists"
+    fi
+    
+    # Check if SSL certificates exist
+    if [ ! -f "$SSL_DIR/server.crt" ] || [ ! -f "$SSL_DIR/server.key" ]; then
+        log "Generating self-signed SSL certificate for PgBouncer"
+        apt-get install -y openssl
+        
+        openssl req -new -x509 -days "${SSL_CERT_VALIDITY:-365}" -nodes \
+            -out "$SSL_DIR/server.crt" \
+            -keyout "$SSL_DIR/server.key" \
+            -subj "/C=${SSL_COUNTRY:-US}/ST=${SSL_STATE:-State}/L=${SSL_LOCALITY:-City}/O=${SSL_ORGANIZATION:-Organization}/CN=${SSL_COMMON_NAME:-localhost}"
+        
+        chmod 640 "$SSL_DIR/server.key"
+        chmod 644 "$SSL_DIR/server.crt"
+        chown postgres:postgres "$SSL_DIR/server.key" "$SSL_DIR/server.crt"
+        
+        log "Self-signed SSL certificate generated"
+    else
+        log "SSL certificates already exist"
     fi
     
     # Function to get SCRAM hash for PostgreSQL user
@@ -556,7 +560,12 @@ configure_pgbouncer() {
     
     # Ensure postgres user has access to pg_shadow for auth_query
     log "Ensuring postgres user has appropriate permissions for auth_query"
-    sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
+    if [ -n "$PG_PASSWORD" ]; then
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
+    else
+        # Try with peer authentication as fallback
+        sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
+    fi
     
     # Create a backup of PgBouncer configuration if it exists
     if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
@@ -627,8 +636,10 @@ EOF
     log "PgBouncer auth_query added to properly support SASL authentication"
     log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
-    # Generate PostgreSQL SCRAM-SHA-256 hash for postgres user
+    # Create new PgBouncer userlist with SCRAM-SHA-256 hashes
     log "Creating new PgBouncer userlist with SCRAM-SHA-256 hashes"
+    
+    # Get postgres user hash using the PGPASSWORD and get_user_hash function
     POSTGRES_PASSWORD_HASH=$(get_user_hash "postgres")
     
     # Check if hash generation was successful
@@ -644,12 +655,24 @@ EOF
     # Add demo user if exists
     if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ]; then
         log "Adding demo user to PgBouncer userlist"
-        if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'")" = "1" ]; then
-            DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
-            echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
-            log "Demo user added to PgBouncer userlist"
+        # Use PGPASSWORD to check if demo user exists
+        if [ -n "$PG_PASSWORD" ]; then
+            if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'" 2>/dev/null)" = "1" ]; then
+                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
+                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
+                log "Demo user added to PgBouncer userlist"
+            else
+                log "Demo user not found in PostgreSQL, skipping"
+            fi
         else
-            log "Demo user not found in PostgreSQL, skipping"
+            # Fallback to using get_postgres_result
+            if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'")" = "1" ]; then
+                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
+                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
+                log "Demo user added to PgBouncer userlist"
+            else
+                log "Demo user not found in PostgreSQL, skipping"
+            fi
         fi
     fi
     
@@ -672,15 +695,19 @@ EOF
     # Verify the auth_query setup
     log "Verifying PostgreSQL permissions for auth_query"
     
-    # Check permissions using PGPASSWORD to avoid password issues
-    has_permission=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')" 2>/dev/null)
-    
-    if [ "$has_permission" != "t" ]; then
-        log "WARNING: postgres user does not have SELECT permission on pg_shadow."
-        log "Granting necessary permissions for auth_query"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
+    # Use PGPASSWORD environment variable to avoid password prompt
+    if [ -n "$PG_PASSWORD" ]; then
+        has_permission=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')" 2>/dev/null)
+        
+        if [ "$has_permission" != "t" ]; then
+            log "WARNING: postgres user does not have SELECT permission on pg_shadow."
+            log "Granting necessary permissions for auth_query"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
+        else
+            log "postgres user has proper permissions for auth_query"
+        fi
     else
-        log "postgres user has proper permissions for auth_query"
+        log "WARNING: PG_PASSWORD not set, skipping permissions verification"
     fi
     
     # Restart PgBouncer to apply changes
