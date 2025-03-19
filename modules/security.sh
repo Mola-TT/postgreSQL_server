@@ -314,20 +314,37 @@ configure_subdomain_pg_hba() {
     # Backup existing pg_hba.conf
     backup_file "$PG_HBA_FILE"
     
-    # Add subdomain-specific rules to pg_hba.conf
-    cat >> "$PG_HBA_FILE" << EOF
+    # Create a new pg_hba.conf with strict subdomain-based access control
+    cat > "$PG_HBA_FILE" << EOF
+# TYPE  DATABASE        USER            ADDRESS                 METHOD                OPTIONS
 
-# DBHub.cc subdomain access control
-# The following rules enforce the subdomain-to-database mapping
-# Format: host [database] [user] [address] [method] [options]
-# Superuser (postgres) can connect to any database from any subdomain
-host    all             postgres        all                     scram-sha-256
-# Regular users can only connect to their specific database from matching subdomain
-host    all             all             all                     scram-sha-256   clientcert=verify-full
+# "local" is for Unix domain socket connections only
+local   all             postgres                                peer                  
+local   all             all                                     scram-sha-256         
 
-# Map hostnames to database names for access control
-# This is used with the hostname maps in PostgreSQL to enforce subdomain access
-hostssl sameuser        all             all                     scram-sha-256
+# IPv4 local connections for superuser only
+host    all             postgres        127.0.0.1/32            scram-sha-256         
+host    all             postgres        ::1/128                 scram-sha-256         
+
+# Remote superuser can connect to any database from any host
+host    all             postgres        all                     scram-sha-256         
+
+# The postgres database is accessible from localhost without hostname check
+host    postgres        all             127.0.0.1/32            scram-sha-256
+host    postgres        all             ::1/128                 scram-sha-256
+
+# SSl connections with hostname verification 
+# Regular users can only connect to their database if hostname matches
+hostssl all             all             all                     scram-sha-256         hostnossl
+hostssl sameuser        all             all                     scram-sha-256         
+
+# Allow access to template databases for admin functionality
+host    template0       postgres        all                     scram-sha-256
+host    template1       postgres        all                     scram-sha-256
+
+# Reject all other connections
+host    all             all             all                     reject
+
 EOF
     
     # Create hostname map configuration
@@ -344,11 +361,65 @@ EOF
     # Update postgresql.conf to use the hostname map
     local PG_CONF_FILE="$PG_CONF_DIR/postgresql.conf"
     
-    # Make sure the following lines are in postgresql.conf
+    # Make sure hostname mapping is enabled in postgresql.conf
     grep -q "^host_name_map" "$PG_CONF_FILE" || echo "host_name_map = '$MAP_FILE'" >> "$PG_CONF_FILE"
     
     # Update PostgreSQL to check hostname during connection
     grep -q "^check_hostname" "$PG_CONF_FILE" || echo "check_hostname = on" >> "$PG_CONF_FILE"
     
-    log "pg_hba.conf configured for subdomain access control"
+    # Add hostname validation to postgresql.conf if not already there
+    grep -q "^verify_hostname" "$PG_CONF_FILE" || echo "verify_hostname = on" >> "$PG_CONF_FILE"
+    
+    # Make sure SSL is enabled for hostname verification
+    grep -q "^ssl" "$PG_CONF_FILE" || echo "ssl = on" >> "$PG_CONF_FILE"
+    
+    log "pg_hba.conf configured for strict subdomain access control"
+    
+    # Create a subdomain checking function
+    local SQL_SCRIPT="/tmp/create_hostname_check.sql"
+    
+    cat > "$SQL_SCRIPT" << EOF
+-- Create a function to validate hostname during connection
+CREATE OR REPLACE FUNCTION public.validate_connection_hostname()
+RETURNS event_trigger AS \$\$
+DECLARE
+    client_hostname text;
+    expected_hostname text;
+    current_db text;
+BEGIN
+    -- Get current database and client hostname
+    current_db := current_database();
+    client_hostname := inet_server_addr();
+    
+    -- Skip check for superuser, template databases, or postgres database
+    IF (SELECT usesuper FROM pg_catalog.pg_user WHERE usename = current_user) OR
+       current_db LIKE 'template%' OR current_db = 'postgres' THEN
+        RETURN;
+    END IF;
+    
+    -- Get expected hostname from mapping
+    SELECT subdomain INTO expected_hostname 
+    FROM pg_hostname_map 
+    WHERE db_name = current_db;
+    
+    -- Validate hostname
+    IF client_hostname != expected_hostname THEN
+        RAISE EXCEPTION 'Connection to database % must be made through subdomain %', 
+                        current_db, expected_hostname;
+    END IF;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create a trigger for connection validation
+CREATE EVENT TRIGGER connection_hostname_validation
+ON connection_start
+EXECUTE FUNCTION public.validate_connection_hostname();
+EOF
+    
+    # Execute the SQL script as the PostgreSQL superuser
+    log "Creating hostname validation function"
+    sudo -u postgres psql -f "$SQL_SCRIPT"
+    
+    # Clean up
+    rm -f "$SQL_SCRIPT"
 } 

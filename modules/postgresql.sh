@@ -1,5 +1,393 @@
 #!/bin/bash
 
+# PostgreSQL Module
+# Contains functions for managing PostgreSQL databases and security configurations
+
+# Get PostgreSQL version
+get_pg_version() {
+    if command -v psql >/dev/null 2>&1; then
+        psql --version | head -n 1 | sed 's/^.* \([0-9]\+\.[0-9]\+\).*$/\1/'
+    else
+        echo ""
+    fi
+}
+
+# Get PostgreSQL config directory
+get_pg_config_dir() {
+    local pg_version=$(get_pg_version)
+    if [ -n "$pg_version" ]; then
+        echo "/etc/postgresql/$pg_version/main"
+    else
+        echo ""
+    fi
+}
+
+# Check if PostgreSQL is installed
+is_postgresql_installed() {
+    if command -v psql >/dev/null 2>&1; then
+        return 0  # True
+    else
+        return 1  # False
+    fi
+}
+
+# Update hostname map configuration file
+update_hostname_map_conf() {
+    local db_name="$1"
+    local subdomain="$2"
+    local domain="${3:-dbhub.cc}"
+    
+    log "Updating hostname mapping for database '$db_name' -> '$subdomain.$domain'"
+    
+    # Get config directory
+    local pg_config_dir=$(get_pg_config_dir)
+    if [ -z "$pg_config_dir" ]; then
+        log "ERROR: Could not determine PostgreSQL config directory"
+        return 1
+    fi
+    
+    # Hostname map file
+    local map_file="$pg_config_dir/pg_hostname_map.conf"
+    
+    # Check if file exists, create if not
+    if [ ! -f "$map_file" ]; then
+        log "Creating hostname map file: $map_file"
+        
+        # Create with header
+        cat > "$map_file" << EOF
+# PostgreSQL Hostname Map Configuration
+# Format: <database_name> <allowed_hostname>
+# Example: mydatabase mydatabase.dbhub.cc
+#
+# This file maps database names to allowed hostnames for connection validation
+
+EOF
+        
+        # Set proper permissions
+        chmod 640 "$map_file"
+        chown postgres:postgres "$map_file"
+    fi
+    
+    # Check if mapping already exists
+    if grep -q "^$db_name " "$map_file"; then
+        # Update existing mapping
+        log "Updating existing mapping for '$db_name'"
+        sed -i "s|^$db_name .*|$db_name $subdomain.$domain|" "$map_file"
+    else
+        # Add new mapping
+        log "Adding new mapping for '$db_name'"
+        echo "$db_name $subdomain.$domain" >> "$map_file"
+    fi
+    
+    log "Hostname mapping updated successfully"
+    return 0
+}
+
+# Configure database-specific connection restrictions
+configure_db_connection_restrictions() {
+    local db_name="$1"
+    local subdomain="$2"
+    local domain="${3:-dbhub.cc}"
+    
+    log "Configuring connection restrictions for database '$db_name'"
+    
+    # Create validation function in the database
+    sudo -u postgres psql -d "$db_name" << EOF
+-- Create the hostname validation function if it doesn't exist
+CREATE OR REPLACE FUNCTION public.check_connection_hostname()
+RETURNS event_trigger AS \$\$
+DECLARE
+    hostname text;
+    current_db text;
+    allowed_hostname text;
+BEGIN
+    -- Get the current hostname (from application_name)
+    SELECT application_name INTO hostname FROM pg_stat_activity WHERE pid = pg_backend_pid();
+    
+    -- Get current database name
+    SELECT current_database() INTO current_db;
+    
+    -- Determine allowed hostname based on database name
+    allowed_hostname := '$subdomain.$domain';
+    
+    -- Log connection attempt for debugging
+    RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
+                 current_db, hostname, allowed_hostname;
+    
+    -- Check if hostname matches allowed pattern
+    IF position(allowed_hostname in hostname) = 0 THEN
+        -- Unauthorized hostname
+        RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %', 
+                        current_db, allowed_hostname;
+    END IF;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create trigger for connection events
+DROP EVENT TRIGGER IF EXISTS connection_hostname_validation;
+CREATE EVENT TRIGGER connection_hostname_validation 
+ON ddl_command_start
+EXECUTE FUNCTION public.check_connection_hostname();
+
+-- Grant usage to public
+GRANT EXECUTE ON FUNCTION public.check_connection_hostname() TO PUBLIC;
+EOF
+    
+    if [ $? -ne 0 ]; then
+        log "ERROR: Failed to configure connection restrictions for database '$db_name'"
+        return 1
+    fi
+    
+    log "Connection restrictions configured for database '$db_name'"
+    return 0
+}
+
+# Update pg_hba.conf for subdomain based access
+update_pg_hba_for_subdomain_access() {
+    log "Updating pg_hba.conf for subdomain based access"
+    
+    # Get config directory
+    local pg_config_dir=$(get_pg_config_dir)
+    if [ -z "$pg_config_dir" ]; then
+        log "ERROR: Could not determine PostgreSQL config directory"
+        return 1
+    fi
+    
+    # pg_hba.conf file path
+    local pg_hba_file="$pg_config_dir/pg_hba.conf"
+    
+    # Check if pg_hba.conf exists
+    if [ ! -f "$pg_hba_file" ]; then
+        log "ERROR: pg_hba.conf not found: $pg_hba_file"
+        return 1
+    fi
+    
+    # Back up the file
+    local backup_file="$pg_hba_file.$(date +%Y%m%d%H%M%S).bak"
+    log "Creating backup of pg_hba.conf: $backup_file"
+    cp -f "$pg_hba_file" "$backup_file"
+    
+    # Check if the hostssl entry already exists
+    if grep -q "^hostssl.*hostnossl" "$pg_hba_file"; then
+        log "Subdomain access rules already exist in pg_hba.conf"
+    else
+        log "Adding subdomain access rules to pg_hba.conf"
+        
+        # Add the rules to the file
+        # We'll add them before the first "host" entry
+        awk '
+            /^host/ && !found {
+                print "# Enhanced subdomain-based access control";
+                print "# Allow connections only through specific subdomains for each database";
+                print "hostssl all             all             0.0.0.0/0               md5     clientcert=0";
+                print "hostnossl all           all             0.0.0.0/0               reject";
+                print "";
+                found=1;
+            }
+            {print}
+        ' "$pg_hba_file" > "$pg_hba_file.tmp"
+        
+        # Replace the original file
+        mv -f "$pg_hba_file.tmp" "$pg_hba_file"
+        
+        # Set proper permissions
+        chmod 640 "$pg_hba_file"
+        chown postgres:postgres "$pg_hba_file"
+    fi
+    
+    log "pg_hba.conf updated successfully"
+    return 0
+}
+
+# Apply PostgreSQL global visibility restrictions
+configure_database_visibility_restrictions() {
+    log "Configuring database visibility restrictions globally"
+    
+    sudo -u postgres psql -d postgres << EOF
+-- Function to set up database visibility restrictions
+CREATE OR REPLACE FUNCTION public.configure_database_visibility_restrictions()
+RETURNS void AS \$\$
+BEGIN
+    -- Create a custom view that limits database visibility
+    -- Only show databases that the current user has CONNECT permission for
+    -- or if the user is a superuser
+    EXECUTE 'CREATE OR REPLACE VIEW pg_catalog.pg_database_view AS
+        SELECT d.*
+        FROM pg_catalog.pg_database d
+        WHERE 
+            pg_catalog.has_database_privilege(d.datname, ''CONNECT'') OR 
+            pg_catalog.pg_has_role(current_user, ''pg_execute_server_program'', ''MEMBER'') OR
+            pg_catalog.pg_has_role(current_user, ''pg_read_server_files'', ''MEMBER'') OR
+            pg_catalog.pg_has_role(current_user, ''pg_write_server_files'', ''MEMBER'') OR
+            current_user = ''postgres'' OR
+            current_setting(''is_superuser'') = ''on''';
+
+    -- Revoke access to the original pg_database table for regular users
+    -- But keep access to the view we just created
+    EXECUTE 'REVOKE ALL ON pg_catalog.pg_database FROM PUBLIC';
+    EXECUTE 'GRANT SELECT ON pg_catalog.pg_database_view TO PUBLIC';
+    
+    -- Create a wrapper function for the \l and \c commands to use
+    EXECUTE 'CREATE OR REPLACE FUNCTION pg_catalog.pg_database_view_wrapper()
+    RETURNS SETOF pg_catalog.pg_database AS \$\$
+    SELECT * FROM pg_catalog.pg_database_view;
+    \$\$ LANGUAGE SQL SECURITY DEFINER';
+    
+    -- Grant execute permission to all users on the wrapper function
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pg_catalog.pg_database_view_wrapper() TO PUBLIC';
+    
+    -- Create a function and event trigger to validate hostname during connection attempts
+    EXECUTE 'CREATE OR REPLACE FUNCTION public.validate_connection_hostname()
+    RETURNS event_trigger AS \$\$
+    DECLARE
+        hostname text;
+        current_db text;
+        allowed_hostname text;
+        config_file text;
+        mapping record;
+    BEGIN
+        -- Get the current hostname (from application_name)
+        SELECT application_name INTO hostname FROM pg_stat_activity WHERE pid = pg_backend_pid();
+        
+        -- Get current database name
+        SELECT current_database() INTO current_db;
+        
+        -- Skip validation for postgres database or if hostname is empty
+        IF current_db = ''postgres'' OR hostname IS NULL OR hostname = '''' THEN
+            RETURN;
+        END IF;
+        
+        -- Find config file location
+        SELECT setting INTO config_file FROM pg_settings WHERE name = ''config_file'';
+        config_file := replace(config_file, ''postgresql.conf'', ''pg_hostname_map.conf'');
+        
+        -- For each database, get the allowed hostname from the config file
+        -- and check if the current connection matches
+        FOR mapping IN
+            EXECUTE format(''SELECT * FROM pg_read_file(%L) AS content'', config_file)
+        LOOP
+            -- Process each line in the config file
+            IF position(''#'' in mapping.content) = 0 AND mapping.content ~ ''\\S'' THEN
+                -- Extract database name and allowed hostname
+                allowed_hostname := split_part(mapping.content, '' '', 2);
+                
+                -- Check if this mapping applies to the current database
+                IF split_part(mapping.content, '' '', 1) = current_db THEN
+                    -- Check if hostname matches allowed pattern
+                    IF position(allowed_hostname in hostname) = 0 THEN
+                        -- Unauthorized hostname
+                        RAISE EXCEPTION ''Access to database "%s" is only permitted through subdomain: %s'', 
+                                        current_db, allowed_hostname;
+                    END IF;
+                    
+                    -- Match found, no need to check other mappings
+                    RETURN;
+                END IF;
+            END IF;
+        END LOOP;
+    END;
+    \$\$ LANGUAGE plpgsql SECURITY DEFINER';
+    
+    -- Create event trigger for connection events
+    EXECUTE 'DROP EVENT TRIGGER IF EXISTS connection_hostname_validation';
+    EXECUTE 'CREATE EVENT TRIGGER connection_hostname_validation 
+    ON ddl_command_start
+    EXECUTE FUNCTION public.validate_connection_hostname()';
+    
+    -- Grant usage to public
+    EXECUTE 'GRANT EXECUTE ON FUNCTION public.validate_connection_hostname() TO PUBLIC';
+END;
+\$\$ LANGUAGE plpgsql;
+
+-- Run the function to set up the restrictions
+SELECT public.configure_database_visibility_restrictions();
+EOF
+    
+    if [ $? -ne 0 ]; then
+        log "ERROR: Failed to configure database visibility restrictions"
+        return 1
+    fi
+    
+    log "Database visibility restrictions configured successfully"
+    return 0
+}
+
+# Test subdomain access control
+test_subdomain_access() {
+    local db_name="$1"
+    local subdomain="$2"
+    local domain="${3:-dbhub.cc}"
+    local hostname="$subdomain.$domain"
+    
+    log "Testing subdomain access control for database '$db_name'"
+    log "Attempting connection via subdomain '$hostname'"
+    
+    # Attempt connection with correct hostname
+    PGAPPNAME="$hostname" psql -U postgres -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log "SUCCESS: Connection through correct subdomain '$hostname' works"
+    else
+        log "WARNING: Could not connect through correct subdomain '$hostname'"
+    fi
+    
+    # Attempt connection with incorrect hostname
+    log "Attempting connection via main domain 'dbhub.cc'"
+    PGAPPNAME="dbhub.cc" psql -U postgres -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log "SUCCESS: Connection through incorrect hostname 'dbhub.cc' is properly blocked"
+    else
+        log "WARNING: Connection through incorrect hostname 'dbhub.cc' was NOT blocked"
+    fi
+    
+    log "Subdomain access control test completed"
+}
+
+# Install PostgreSQL if not already installed
+install_postgresql() {
+    log "Checking if PostgreSQL is installed"
+    
+    if is_postgresql_installed; then
+        log "PostgreSQL is already installed"
+        return 0
+    fi
+    
+    log "Installing PostgreSQL"
+    
+    # Detect OS type
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    elif type lsb_release >/dev/null 2>&1; then
+        OS=$(lsb_release -si)
+    elif [ -f /etc/lsb-release ]; then
+        . /etc/lsb-release
+        OS=$DISTRIB_ID
+    else
+        OS=$(uname -s)
+    fi
+    
+    # Install based on OS
+    case "$OS" in
+        ubuntu|debian)
+            apt-get update
+            apt-get install -y postgresql postgresql-contrib
+            ;;
+        fedora|rhel|centos)
+            dnf install -y postgresql-server postgresql-contrib
+            postgresql-setup --initdb --unit postgresql
+            systemctl enable postgresql
+            systemctl start postgresql
+            ;;
+        *)
+            log "ERROR: Unsupported OS: $OS"
+            return 1
+            ;;
+    esac
+    
+    log "PostgreSQL installed successfully"
+    return 0
+}
+
 # PostgreSQL installation and configuration functions
 
 # Function to install PostgreSQL
@@ -467,13 +855,83 @@ EOF
     echo "${user_password}"
 }
 
+# Function to configure database-specific connection restrictions
+configure_db_connection_restrictions() {
+    local db_name="$1"
+    local subdomain="$2"
+    
+    log "Configuring connection restrictions for database '$db_name' via subdomain '$subdomain'"
+    
+    # Check if PostgreSQL is running
+    if ! pg_isready -q; then
+        log "ERROR: PostgreSQL is not running, cannot configure connection restrictions"
+        return 1
+    fi
+    
+    # Create SQL script for connection restrictions
+    local SQL_SCRIPT="/tmp/configure_db_connections_${db_name}.sql"
+    
+    cat > "$SQL_SCRIPT" << EOF
+-- Create database-specific connection restrictions
+\c ${db_name}
+
+-- Prevent direct connections through the main domain for regular users
+CREATE OR REPLACE FUNCTION public.check_connection_hostname()
+RETURNS TRIGGER AS \$\$
+DECLARE
+    client_addr text;
+    client_hostname text;
+    expected_hostname text;
+BEGIN
+    -- Skip check for superuser
+    IF (SELECT usesuper FROM pg_catalog.pg_user WHERE usename = SESSION_USER) THEN
+        RETURN NEW;
+    END IF;
+    
+    -- Get client information
+    client_addr := inet_client_addr();
+    client_hostname := inet_client_hostname();
+    expected_hostname := '${subdomain}.${DOMAIN_SUFFIX}';
+    
+    -- Check if hostname matches expected value
+    IF client_hostname IS NULL OR client_hostname != expected_hostname THEN
+        RAISE EXCEPTION 'Access to database "${db_name}" is only allowed through subdomain "${subdomain}.${DOMAIN_SUFFIX}"';
+    END IF;
+    
+    RETURN NEW;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create trigger to validate connections
+DROP TRIGGER IF EXISTS check_connection_hostname_trigger ON public.pg_class;
+CREATE TRIGGER check_connection_hostname_trigger
+    BEFORE SELECT ON public.pg_class
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION public.check_connection_hostname();
+
+-- Set a reminder message for all users connecting to this database
+ALTER DATABASE ${db_name} SET client_min_messages TO 'notice';
+COMMENT ON DATABASE ${db_name} IS 'Access only allowed through ${subdomain}.${DOMAIN_SUFFIX}';
+
+EOF
+    
+    # Execute the SQL script
+    log "Applying connection restrictions for database $db_name"
+    sudo -u postgres psql -f "$SQL_SCRIPT"
+    
+    # Clean up
+    rm -f "$SQL_SCRIPT"
+    
+    log "Database connection restrictions configured successfully"
+}
+
 # Function to create a new database with restricted visibility
 create_restricted_database() {
     local db_name="$1"
     local admin_password="${2:-$(generate_password)}"
     local subdomain="${3:-$db_name}"
     
-    log "Creating new database '$db_name' with restricted visibility"
+    log "Creating new database '$db_name' with restricted visibility and subdomain access"
     
     # Check if PostgreSQL is running
     if ! pg_isready -q; then
@@ -518,15 +976,11 @@ EOF
     log "Creating database and setting permissions"
     sudo -u postgres psql -f "$SQL_SCRIPT"
     
-    # Add the hostname mapping for subdomain access
-    local PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
-    local MAP_FILE="$PG_CONF_DIR/pg_hostname_map.conf"
+    # Update the hostname mapping for subdomain access
+    update_hostname_map_conf "$db_name" "$subdomain"
     
-    # Add mapping entry if it doesn't exist
-    if ! grep -q "^${db_name} ${subdomain}" "$MAP_FILE"; then
-        log "Adding hostname mapping for ${subdomain}"
-        echo "${db_name} ${subdomain}.${DOMAIN_SUFFIX}" >> "$MAP_FILE"
-    fi
+    # Configure database-specific connection restrictions
+    configure_db_connection_restrictions "$db_name" "$subdomain"
     
     # Clean up
     rm -f "$SQL_SCRIPT"

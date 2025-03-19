@@ -1,211 +1,230 @@
 #!/bin/bash
 
-# Common functions for PostgreSQL server setup
+# Common Utility Module
+# Contains shared utility functions for the DBHub.cc scripts
 
-# Configuration
-LOG_FILE="/var/log/dbhub_setup.log"
+# Set default values
+DEFAULT_DOMAIN="dbhub.cc"
+DEFAULT_LOG_FILE="/var/log/dbhub/operations.log"
 
-# Function to log messages
-log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
-
-# Function to handle errors
-error_handler() {
-    local exit_code=$?
-    local line_number=$1
-    if [ $exit_code -ne 0 ]; then
-        log "ERROR: Command failed at line $line_number with exit code $exit_code"
-        exit $exit_code
+# Initialize the script environment
+init_environment() {
+    # Ensure the log directory exists
+    if [ ! -d "$(dirname "$DEFAULT_LOG_FILE")" ]; then
+        mkdir -p "$(dirname "$DEFAULT_LOG_FILE")"
+        chmod 755 "$(dirname "$DEFAULT_LOG_FILE")"
+    fi
+    
+    # Set up error handling
+    set -o pipefail
+    
+    # Check if running as root
+    if [ "$EUID" -ne 0 ]; then
+        echo "WARNING: This script should typically be run with root privileges"
     fi
 }
 
-# Set up error handling
-trap 'error_handler $LINENO' ERR
-
-# Function to generate a random password
-generate_password() {
-    tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 16
+# Logging function
+log() {
+    local message="$1"
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local log_message="[${timestamp}] ${message}"
+    
+    # Print to stdout
+    echo "$log_message"
+    
+    # Write to log file if writable
+    if [ -w "$(dirname "$DEFAULT_LOG_FILE")" ]; then
+        echo "$log_message" >> "$DEFAULT_LOG_FILE"
+    fi
 }
 
-# Function to check if a command exists
+# Display a banner with version information
+show_banner() {
+    local script_name="${1:-Script}"
+    local version="${2:-1.0.0}"
+    
+    echo "=============================================="
+    echo "  DBHub.cc - $script_name v$version"
+    echo "=============================================="
+    echo "  Server: $(hostname)"
+    echo "  Date: $(date)"
+    echo "  User: $(whoami)"
+    echo "=============================================="
+    echo ""
+}
+
+# Check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to check if a package is installed
-package_installed() {
-    dpkg -l "$1" | grep -q "^ii" >/dev/null 2>&1
-}
-
-# Function to install a package if it's not already installed
-install_package() {
-    if ! package_installed "$1"; then
-        log "Installing package: $1"
-        apt-get install -y "$1"
+# Check if a service is running
+service_is_running() {
+    local service_name="$1"
+    
+    if command_exists systemctl; then
+        systemctl is-active --quiet "$service_name"
+    elif command_exists service; then
+        service "$service_name" status >/dev/null 2>&1
     else
-        log "Package already installed: $1"
+        ps aux | grep -v grep | grep -q "$service_name"
     fi
 }
 
-# Function to check if a service is running
-service_running() {
-    local service_name="$1"
+# Run a command with error handling
+run_command() {
+    local cmd="$1"
+    local error_msg="${2:-Command failed}"
     
-    # Special handling for PostgreSQL
-    if [[ "$service_name" == "postgresql" ]]; then
-        # First try pg_isready if available
-        if command_exists pg_isready; then
-            if pg_isready -q; then
-                return 0
-            fi
-        fi
-        
-        # Check for specific PostgreSQL service patterns
-        if systemctl list-units --state=active | grep -q "postgresql@.*\.service"; then
-            return 0
-        fi
+    log "Executing: $cmd"
+    
+    # Run the command
+    eval "$cmd"
+    local result=$?
+    
+    # Check result
+    if [ $result -ne 0 ]; then
+        log "ERROR: $error_msg (exit code: $result)"
+        return $result
     fi
     
-    # Standard check for other services
-    systemctl is-active "$service_name" >/dev/null 2>&1
+    return 0
 }
 
-# Function to restart a service if it's running
-restart_service() {
-    local service_name="$1"
+# Check if a file exists and is readable
+file_exists_readable() {
+    local file_path="$1"
     
-    # Special handling for PostgreSQL
-    if [[ "$service_name" == "postgresql" ]]; then
-        log "Restarting PostgreSQL"
-        
-        # Try to use pg_ctlcluster if available
-        if command_exists pg_ctlcluster && command_exists pg_lsclusters; then
-            # Get the list of running clusters
-            local clusters=$(pg_lsclusters | grep -v "down" | awk '{print $1" "$2}')
-            
-            if [ -n "$clusters" ]; then
-                log "Restarting PostgreSQL clusters"
-                while read -r version cluster; do
-                    log "Restarting PostgreSQL cluster $version $cluster"
-                    pg_ctlcluster "$version" "$cluster" restart
-                done <<< "$clusters"
-                return 0
-            fi
-        fi
-        
-        # If pg_ctlcluster failed or no clusters found, try systemctl
-        if systemctl list-units --state=active | grep -q "postgresql@.*\.service"; then
-            local pg_services=$(systemctl list-units --state=active | grep "postgresql@.*\.service" | awk '{print $1}')
-            while read -r service; do
-                log "Restarting PostgreSQL service $service"
-                systemctl restart "$service"
-            done <<< "$pg_services"
-            return 0
-        fi
-        
-        # Fallback to generic service
-        log "Using generic PostgreSQL service"
-        systemctl restart postgresql
+    if [ -f "$file_path" ] && [ -r "$file_path" ]; then
         return 0
-    fi
-    
-    # Standard restart for other services
-    if systemctl is-active "$service_name" >/dev/null 2>&1; then
-        log "Restarting service: $service_name"
-        systemctl restart "$service_name"
     else
-        log "Starting service: $service_name"
-        systemctl start "$service_name"
+        return 1
     fi
 }
 
-# Function to enable a service
-enable_service() {
-    log "Enabling service: $1"
-    systemctl enable "$1"
-}
-
-# Function to create a directory if it doesn't exist
-create_directory() {
-    if [ ! -d "$1" ]; then
-        log "Creating directory: $1"
-        mkdir -p "$1"
+# Check if a directory exists and is writable
+dir_exists_writable() {
+    local dir_path="$1"
+    
+    if [ -d "$dir_path" ] && [ -w "$dir_path" ]; then
+        return 0
+    else
+        return 1
     fi
 }
 
-# Function to backup a file
+# Create a backup of a file with timestamp
 backup_file() {
-    local file="$1"
-    if [ -f "$file" ]; then
-        local backup_file="${file}.$(date +'%Y%m%d%H%M%S').bak"
-        log "Backing up file: $file to $backup_file"
-        cp "$file" "$backup_file"
+    local file_path="$1"
+    local backup_dir="${2:-/var/backups/dbhub}"
+    
+    # Ensure backup directory exists
+    if [ ! -d "$backup_dir" ]; then
+        mkdir -p "$backup_dir"
+        chmod 755 "$backup_dir"
+    fi
+    
+    # Check if file exists
+    if [ ! -f "$file_path" ]; then
+        log "WARNING: Cannot backup non-existent file: $file_path"
+        return 1
+    fi
+    
+    # Create backup with timestamp
+    local timestamp=$(date "+%Y%m%d%H%M%S")
+    local filename=$(basename "$file_path")
+    local backup_path="${backup_dir}/${filename}.${timestamp}.bak"
+    
+    cp -p "$file_path" "$backup_path"
+    
+    if [ $? -eq 0 ]; then
+        log "Created backup: $backup_path"
+        return 0
+    else
+        log "ERROR: Failed to create backup of $file_path"
+        return 1
     fi
 }
 
-# Function to send an email
-send_email() {
-    local subject="$1"
-    local message="$2"
+# Wait for a service to be ready
+wait_for_service() {
+    local service_name="$1"
+    local max_wait="${2:-60}"  # Default timeout 60 seconds
+    local check_cmd="${3:-service_is_running $service_name}"
     
-    if [ -n "$EMAIL_RECIPIENT" ] && [ -n "$EMAIL_SENDER" ] && [ -n "$SMTP_SERVER" ]; then
-        log "Sending email to $EMAIL_RECIPIENT: $subject"
+    log "Waiting for $service_name to be ready (timeout: ${max_wait}s)"
+    
+    local counter=0
+    while [ $counter -lt $max_wait ]; do
+        if eval "$check_cmd"; then
+            log "$service_name is ready"
+            return 0
+        fi
         
-        # Create email content
-        local email_content=$(cat <<EOF
-From: $EMAIL_SENDER
-To: $EMAIL_RECIPIENT
-Subject: $subject
-MIME-Version: 1.0
-Content-Type: text/plain; charset=utf-8
-Content-Transfer-Encoding: 8bit
+        counter=$((counter + 1))
+        sleep 1
+    done
+    
+    log "ERROR: Timeout waiting for $service_name"
+    return 1
+}
 
-$message
-
---
-This is an automated message from your DBHub.cc server.
-Time: $(date)
-EOF
-)
-        
-        # Send email using curl with SSL
-        curl --url "smtps://$SMTP_SERVER:$SMTP_PORT" \
-             --ssl-reqd \
-             --mail-from "$EMAIL_SENDER" \
-             --mail-rcpt "$EMAIL_RECIPIENT" \
-             --user "$SMTP_USER:$SMTP_PASS" \
-             --upload-file - <<< "$email_content"
+# Check if a port is in use
+port_is_used() {
+    local port="$1"
+    
+    if command_exists netstat; then
+        netstat -tuln | grep -q ":$port "
+    elif command_exists ss; then
+        ss -tuln | grep -q ":$port "
     else
-        log "Email configuration not complete, skipping email notification"
+        return 1  # Cannot determine
     fi
 }
 
-# Function to setup environment variables
-setup_environment() {
-    log "Setting up environment variables"
-    
-    # Check for .env file
-    ENV_FILE="./.env"
-    if [ -f "$ENV_FILE" ]; then
-        log "Loading environment variables from $ENV_FILE"
-        set -a
-        source "$ENV_FILE"
-        set +a
+# Get OS type and version
+get_os_info() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "OS: $NAME $VERSION_ID"
+    elif command_exists lsb_release; then
+        echo "OS: $(lsb_release -sd)"
     else
-        log "ERROR: Environment file $ENV_FILE not found"
-        log "Please create an environment file based on .env.example"
-        exit 1
+        echo "OS: $(uname -s) $(uname -r)"
+    fi
+}
+
+# Parse configuration file
+parse_config() {
+    local config_file="$1"
+    
+    if [ ! -f "$config_file" ]; then
+        log "WARNING: Configuration file not found: $config_file"
+        return 1
     fi
     
-    # Backup environment file
-    ENV_BACKUP_DIR="./.env_backups"
-    mkdir -p "$ENV_BACKUP_DIR"
-    ENV_BACKUP_FILE="$ENV_BACKUP_DIR/.env.$(date +'%Y%m%d%H%M%S')"
-    log "Backing up environment file"
-    cp "$ENV_FILE" "$ENV_BACKUP_FILE"
+    # Read configuration file line by line
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        # Skip comments and empty lines
+        if [[ "$key" =~ ^[[:space:]]*# ]] || [[ -z "$key" ]]; then
+            continue
+        fi
+        
+        # Trim whitespace
+        key=$(echo "$key" | tr -d '[:space:]')
+        value=$(echo "$value" | tr -d '[:space:]')
+        
+        # Export the variable
+        export "$key"="$value"
+    done < "$config_file"
     
-    # Set permissions on environment files
-    chmod 600 "$ENV_FILE"
-    chmod 600 "$ENV_BACKUP_FILE"
-} 
+    log "Configuration loaded from $config_file"
+    return 0
+}
+
+# Initialize the environment if this script is being run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    init_environment
+    show_banner "Common Utilities" "1.0.0"
+fi 
