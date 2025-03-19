@@ -1,0 +1,42 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Filename: postgresql_server_rules.mdc
+
+## General PostgreSQL Server Behavior Rules
+
+### Superuser Access
+- The PostgreSQL superuser (`postgres`) is the only user that can connect to and manage all databases.
+- The superuser can access any database using both the primary domain (`example.com`) and its subdomains (e.g., `demo.example.com`).
+
+### Database Creation Defaults
+- When a new database is created, an admin user named `admin` is also created for that database.
+- The `admin` user is granted full administrative privileges for its respective database.
+- The `admin` user does **not** have access to any other databases.
+
+### Database-Specific User Restrictions
+- Any user created by the `admin` user is restricted to the specific database it was created in.
+- These users cannot access other databases, ensuring strict database isolation.
+
+### Subdomain-Based Access Control
+- Each database is accessible only through its respective subdomain.
+  - Example: If a database named `demo` is created, only `demo.example.com` can be used to connect.
+  - Users of `demo` (including its `admin`) **cannot** access the database via `example.com`, only `demo.example.com`.
+- The PostgreSQL superuser (`postgres`) is the **only** user who can access any database through both `example.com` and subdomains like `demo.example.com`.
+
+### Default PostgreSQL Behavior
+- This setup reflects the default PostgreSQL behavior when using per-database user management.
+- Role inheritance and access control lists (ACLs) are managed per database.
+- Host-based authentication (HBA) and connection settings should enforce this subdomain-based restriction.
+
+### Expected AI Behavior
+- The AI should respect the described access control model when suggesting role assignments.
+- When generating SQL scripts or configuration settings, it should align with the above rules.
+- AI recommendations for connection configurations should ensure that:
+  - Database-specific users are restricted to subdomain access.
+  - The superuser retains unrestricted access.
+  - Host-based authentication (pg_hba.conf) settings enforce these rules.
+
+## End of Rules
