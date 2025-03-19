@@ -44,6 +44,11 @@ SSL_COMMON_NAME="db.example.com"
 LOG_DIR="/var/log/dbhub"
 LOG_FILE="$LOG_DIR/server_init.log"
 
+# PostgreSQL configuration paths
+PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
+PG_CONF_FILE="$PG_CONF_DIR/postgresql.conf"
+PG_HBA_CONF="$PG_CONF_DIR/pg_hba.conf"
+
 # Ensure log directory exists
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 touch "$LOG_FILE" 2>/dev/null || true
@@ -63,6 +68,29 @@ command_exists() {
 # Function to check if a package is installed
 package_installed() {
     dpkg -l "$1" | grep -q "^ii" >/dev/null 2>&1
+}
+
+# Create a backup of a file with timestamp
+backup_file() {
+    local file_path="$1"
+    local backup_path="${file_path}.$(date +%Y%m%d%H%M%S).bak"
+    
+    # Check if file exists
+    if [ ! -f "$file_path" ]; then
+        log "WARNING: Cannot backup non-existent file: $file_path"
+        return 1
+    fi
+    
+    # Create backup
+    cp -f "$file_path" "$backup_path"
+    
+    if [ $? -eq 0 ]; then
+        log "Created backup: $backup_path"
+        return 0
+    else
+        log "ERROR: Failed to create backup of $file_path"
+        return 1
+    fi
 }
 
 # Function to check PostgreSQL logs for errors
