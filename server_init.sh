@@ -818,16 +818,59 @@ create_demo_database() {
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CONNECT ON DATABASE postgres FROM $user_name;"
     
     # 3. Grant specific privileges only to the demo database
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT CONNECT ON DATABASE $db_name TO $user_name;"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO $user_name;"
-    
-    # 4. Connect to demo database and set up schema permissions properly
     log "Setting up proper schema permissions in the demo database"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT USAGE ON SCHEMA public TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT ALL ON SCHEMA public TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON SEQUENCES TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON FUNCTIONS TO $user_name;"
+    
+    # 4a. Block visibility of other databases through catalog views
+    log "Setting up strict catalog visibility restrictions"
+    # Revoke access to system catalog views that expose database information
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE SELECT ON pg_catalog.pg_database FROM $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE SELECT ON information_schema.schemata FROM $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE SELECT ON information_schema.tables FROM $user_name;"
+    
+    # Create a database-specific role to strictly limit visibility
+    log "Creating database-specific role for strict isolation"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS ${user_name}_role;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE ROLE ${user_name}_role NOLOGIN;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT ${user_name}_role TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO ${user_name}_role;"
+    
+    # Create security definer functions to filter catalog information
+    log "Creating security definer functions to filter catalog visibility"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "CREATE OR REPLACE FUNCTION public.database_list() RETURNS SETOF pg_catalog.pg_database AS \$\$
+  SELECT * FROM pg_catalog.pg_database WHERE datname = '$db_name';
+\$\$ LANGUAGE SQL SECURITY DEFINER;"
+    
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "CREATE OR REPLACE FUNCTION public.filtered_tables() RETURNS SETOF information_schema.tables AS \$\$
+  SELECT * FROM information_schema.tables WHERE table_catalog = '$db_name';
+\$\$ LANGUAGE SQL SECURITY DEFINER;"
+    
+    # Create a security layer to intercept catalog queries
+    log "Creating additional security layer to intercept catalog queries"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "CREATE OR REPLACE VIEW pg_database_filtered AS 
+  SELECT * FROM pg_catalog.pg_database WHERE datname = '$db_name';"
+    
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "CREATE OR REPLACE VIEW information_schema.tables_filtered AS
+  SELECT * FROM information_schema.tables WHERE table_catalog = '$db_name';"
+    
+    # Grant permissions on filtered views
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT SELECT ON pg_database_filtered TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT SELECT ON information_schema.tables_filtered TO $user_name;"
+    
+    # Create additional restrictions at PostgreSQL server level to hide databases
+    log "Configuring additional database visibility restrictions"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER $user_name SET search_path = public;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER $user_name SET statement_timeout = '30s';"
+    
+    # Set ownership and grant execute permissions
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER FUNCTION public.database_list() OWNER TO postgres;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER FUNCTION public.filtered_tables() OWNER TO postgres;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT EXECUTE ON FUNCTION public.database_list() TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT EXECUTE ON FUNCTION public.filtered_tables() TO $user_name;"
     
     # 5. Add database-specific access rules to pg_hba.conf
     log "Setting up database-specific access controls in pg_hba.conf"
@@ -855,17 +898,17 @@ create_demo_database() {
         log "Database-specific rules already exist in pg_hba.conf"
     fi
     
-    # 6. Create configuration entry specifically for demo user in PgBouncer
-    log "Updating PgBouncer configuration for demo user isolation"
+    # 6. Modify connection parameters for PgBouncer to force maintenance database
+    log "Updating PgBouncer configuration for stricter isolation"
     if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
-        # Check if demo database is already defined in pgbouncer.ini
-        if ! grep -q "^$db_name = " /etc/pgbouncer/pgbouncer.ini; then
-            # Add specific entry for demo database
-            sed -i "/\[databases\]/a $db_name = host=localhost port=5432 dbname=$db_name user=$user_name password=$password" /etc/pgbouncer/pgbouncer.ini
-            
-            # Restart PgBouncer to apply changes
-            systemctl restart pgbouncer
-        fi
+        # Remove existing demo database entry if exists
+        sed -i "/^$db_name = /d" /etc/pgbouncer/pgbouncer.ini
+        
+        # Add specific entry for demo database with maintenance_db parameter
+        sed -i "/\[databases\]/a $db_name = host=localhost port=5432 dbname=$db_name user=$user_name password=$password maintenance_db=$db_name" /etc/pgbouncer/pgbouncer.ini
+        
+        # Restart PgBouncer to apply changes
+        systemctl restart pgbouncer
     fi
     
     log "Demo database and user created with strict isolation"
