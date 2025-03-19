@@ -817,11 +817,9 @@ create_demo_database() {
                              WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
                              ORDER BY relkind, nspname, relname;"
             
-            # Try to drop these objects
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "$objects_sql" | while read schema table kind; do
+            # Try to drop these objects - using -t (tuples only) and -A (unaligned) for clean output
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$objects_sql" | while read schema table kind; do
                 [ -z "$schema" ] && continue
-                [ "$schema" = "---------" ] && continue  # Skip header separator
-                [ "$schema" = "(0" ] && continue # Skip count line
                 
                 if [ "$kind" = "r" ]; then # regular table
                     log "Dropping table $schema.$table owned by $user_name"
@@ -844,11 +842,9 @@ create_demo_database() {
                               WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
                               ORDER BY nspname, proname;"
             
-            # Try to drop these functions
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "$functions_sql" | while read schema func; do
+            # Try to drop these functions - using -t (tuples only) and -A (unaligned) for clean output
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$functions_sql" | while read schema func; do
                 [ -z "$schema" ] && continue
-                [ "$schema" = "---------" ] && continue  # Skip header separator
-                [ "$schema" = "(0" ] && continue # Skip count line
                 
                 log "Dropping function $schema.$func owned by $user_name"
                 PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP FUNCTION IF EXISTS $schema.$func CASCADE;"
