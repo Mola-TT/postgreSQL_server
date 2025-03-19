@@ -783,51 +783,92 @@ create_demo_database() {
     log "Using demo database name: $db_name"
     log "Using demo username: $user_name"
     
-    # Create demo database
+    # First drop the user if it exists to ensure clean permissions (drop owned objects first)
+    log "Checking if demo user exists"
+    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
+        log "Demo user already exists, dropping owned objects and user for clean slate"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;"
+    fi
+    
+    # Create demo database (make sure it's owned by postgres initially)
     log "Creating demo database"
     if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" != "1" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE DATABASE $db_name"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE DATABASE $db_name OWNER postgres;"
         log "Demo database created"
     else
-        log "Demo database already exists"
+        log "Demo database already exists, ensuring correct ownership"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
     fi
     
-    # Create demo user
-    log "Creating demo user"
-    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" != "1" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE USER $user_name WITH PASSWORD '$password'"
-        log "Demo user created"
-    else
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER $user_name WITH PASSWORD '$password'"
-        log "Demo user password updated"
-    fi
+    # Create demo user with limited privileges (NOINHERIT prevents inheriting permissions from PUBLIC role)
+    log "Creating demo user with restricted permissions"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE USER $user_name WITH PASSWORD '$password' NOINHERIT NOCREATEDB NOCREATEROLE;"
+    log "Demo user created with restricted permissions"
     
-    # Secure the demo user by implementing proper isolation
-    log "Implementing security restrictions for demo user"
+    # Secure isolation at the server level
+    log "Implementing comprehensive security restrictions for demo user"
     
-    # 1. Revoke default PUBLIC privileges to restrict access to system tables
+    # 1. Revoke default PUBLIC privileges
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON SCHEMA public FROM PUBLIC;"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT USAGE ON SCHEMA public TO $user_name;"
     
-    # 2. Explicitly revoke demo user's connect permission to postgres database 
+    # 2. Explicitly revoke connect permission to postgres database 
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON DATABASE postgres FROM PUBLIC;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON DATABASE postgres FROM $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CONNECT ON DATABASE postgres FROM $user_name;"
     
     # 3. Grant specific privileges only to the demo database
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT CONNECT ON DATABASE $db_name TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO $user_name;"
     
     # 4. Connect to demo database and set up schema permissions properly
     log "Setting up proper schema permissions in the demo database"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT USAGE ON SCHEMA public TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT ALL ON SCHEMA public TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON SEQUENCES TO $user_name;"
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON FUNCTIONS TO $user_name;"
     
-    # 5. Create a login restriction to ensure demo user can only connect to its own database
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER $user_name WITH CONNECTION LIMIT 20;"
+    # 5. Add database-specific access rules to pg_hba.conf
+    log "Setting up database-specific access controls in pg_hba.conf"
+    local pg_hba_path=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SHOW hba_file;")
     
-    log "Demo database and user created with restricted privileges"
+    # Check if these rules already exist before adding them
+    if ! grep -q "host\s\+$db_name\s\+$user_name" "$pg_hba_path"; then
+        log "Adding database-specific rules to pg_hba.conf"
+        
+        # Make a backup of the existing pg_hba.conf
+        cp "$pg_hba_path" "${pg_hba_path}.bak.$(date +%Y%m%d%H%M%S)"
+        
+        # Add rules to explicitly allow demo user to connect only to demo database
+        # and explicitly deny access to postgres database
+        echo "" >> "$pg_hba_path"
+        echo "# DBHub specific rules for demo user isolation" >> "$pg_hba_path"
+        echo "host    $db_name        $user_name       0.0.0.0/0               scram-sha-256" >> "$pg_hba_path"
+        echo "host    postgres        $user_name       0.0.0.0/0               reject" >> "$pg_hba_path"
+        echo "local   postgres        $user_name                               reject" >> "$pg_hba_path"
+        
+        # Reload PostgreSQL to apply changes
+        log "Reloading PostgreSQL configuration to apply pg_hba.conf changes"
+        pg_ctlcluster $PG_VERSION main reload || systemctl reload postgresql
+    else
+        log "Database-specific rules already exist in pg_hba.conf"
+    fi
+    
+    # 6. Create configuration entry specifically for demo user in PgBouncer
+    log "Updating PgBouncer configuration for demo user isolation"
+    if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
+        # Check if demo database is already defined in pgbouncer.ini
+        if ! grep -q "^$db_name = " /etc/pgbouncer/pgbouncer.ini; then
+            # Add specific entry for demo database
+            sed -i "/\[databases\]/a $db_name = host=localhost port=5432 dbname=$db_name user=$user_name password=$password" /etc/pgbouncer/pgbouncer.ini
+            
+            # Restart PgBouncer to apply changes
+            systemctl restart pgbouncer
+        fi
+    fi
+    
+    log "Demo database and user created with strict isolation"
     log "Demo user can ONLY access the $db_name database"
     log "Demo username: $user_name"
     log "Demo password: $password"
