@@ -593,10 +593,8 @@ logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
 listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
-auth_type = scram-sha-256
+auth_type = plain
 auth_file = /etc/pgbouncer/userlist.txt
-auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=\$1
-auth_user = postgres
 admin_users = postgres
 stats_users = postgres
 pool_mode = ${POOL_MODE:-transaction}
@@ -632,25 +630,15 @@ EOF
     
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
-    log "PgBouncer authentication set to scram-sha-256 to match PostgreSQL"
-    log "PgBouncer auth_query added to properly support SASL authentication"
+    log "PgBouncer authentication set to plain for better compatibility"
     log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
-    # Create new PgBouncer userlist with SCRAM-SHA-256 hashes
-    log "Creating new PgBouncer userlist with SCRAM-SHA-256 hashes"
+    # Create new PgBouncer userlist with plain passwords
+    log "Creating new PgBouncer userlist with plain passwords"
     
-    # Get postgres user hash using the PGPASSWORD and get_user_hash function
-    POSTGRES_PASSWORD_HASH=$(get_user_hash "postgres")
-    
-    # Check if hash generation was successful
-    if [[ "$POSTGRES_PASSWORD_HASH" == SCRAM-SHA-256* ]]; then
-        log "Successfully generated SCRAM hash for postgres user"
-        echo "\"postgres\" \"$POSTGRES_PASSWORD_HASH\"" > "/etc/pgbouncer/userlist.txt"
-    else
-        log "WARNING: Failed to generate SCRAM hash. Using plain text password as fallback."
-        # Use plain text password as fallback (less secure but more compatible)
-        echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
-    fi
+    # Use plain text password for postgres user
+    echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
+    log "Successfully added postgres user to PgBouncer userlist"
     
     # Add demo user if exists
     if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ]; then
@@ -658,8 +646,7 @@ EOF
         # Use PGPASSWORD to check if demo user exists
         if [ -n "$PG_PASSWORD" ]; then
             if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'" 2>/dev/null)" = "1" ]; then
-                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
-                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
+                echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
                 log "Demo user added to PgBouncer userlist"
             else
                 log "Demo user not found in PostgreSQL, skipping"
@@ -667,8 +654,7 @@ EOF
         else
             # Fallback to using get_postgres_result
             if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'")" = "1" ]; then
-                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
-                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> /etc/pgbouncer/userlist.txt
+                echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
                 log "Demo user added to PgBouncer userlist"
             else
                 log "Demo user not found in PostgreSQL, skipping"
