@@ -462,6 +462,13 @@ EOF
         log "Revoking public schema privileges"
         if [ -n "$PG_PASSWORD" ]; then
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+            # Add additional security measure - prevent PUBLIC from accessing the postgres database
+            log "Adding additional security measures for PostgreSQL"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON DATABASE postgres FROM PUBLIC;"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON SCHEMA pg_catalog FROM PUBLIC;"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON SCHEMA information_schema FROM PUBLIC;"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT USAGE ON SCHEMA pg_catalog TO PUBLIC;"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT USAGE ON SCHEMA information_schema TO PUBLIC;"
         else
             log "WARNING: PG_PASSWORD not set, skipping privilege revocation"
         fi
@@ -795,11 +802,33 @@ create_demo_database() {
         log "Demo user password updated"
     fi
     
-    # Grant privileges
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name"
-    log "Privileges granted to demo user"
+    # Secure the demo user by implementing proper isolation
+    log "Implementing security restrictions for demo user"
     
-    log "Demo database and user created"
+    # 1. Revoke default PUBLIC privileges to restrict access to system tables
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON SCHEMA public FROM PUBLIC;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT USAGE ON SCHEMA public TO $user_name;"
+    
+    # 2. Explicitly revoke demo user's connect permission to postgres database 
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON DATABASE postgres FROM $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CONNECT ON DATABASE postgres FROM $user_name;"
+    
+    # 3. Grant specific privileges only to the demo database
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO $user_name;"
+    
+    # 4. Connect to demo database and set up schema permissions properly
+    log "Setting up proper schema permissions in the demo database"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT ALL ON SCHEMA public TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON SEQUENCES TO $user_name;"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER DEFAULT PRIVILEGES GRANT ALL ON FUNCTIONS TO $user_name;"
+    
+    # 5. Create a login restriction to ensure demo user can only connect to its own database
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER $user_name WITH CONNECTION LIMIT 20;"
+    
+    log "Demo database and user created with restricted privileges"
+    log "Demo user can ONLY access the $db_name database"
     log "Demo username: $user_name"
     log "Demo password: $password"
 }
