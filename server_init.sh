@@ -436,7 +436,8 @@ EOF
     # Set PostgreSQL password
     if [ -n "$PG_PASSWORD" ]; then
         log "Setting PostgreSQL password"
-        run_postgres_command "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD'"
+        # Use peer authentication to set the password (no password needed)
+        sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD'"
         log "PostgreSQL password set successfully"
         
         # Now update pg_hba.conf to use scram-sha-256 for postgres user for PgBouncer compatibility
@@ -522,18 +523,29 @@ configure_pgbouncer() {
     get_user_hash() {
         local username="$1"
         
-        # Use PGPASSWORD to avoid prompts and connect directly as postgres
+        # First try using peer authentication to avoid password authentication issues
+        local hash=$(sudo -u postgres psql -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
+        
+        # Check if we got a valid hash with peer auth
+        if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
+            echo "$hash"
+            return 0
+        fi
+        
+        # Fallback to using PGPASSWORD if peer auth didn't work
         if [ -n "$PG_PASSWORD" ]; then
-            local hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
+            hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
             
             # Check if we got a valid hash
-            if [ -z "$hash" ] || [[ "$hash" != SCRAM-SHA-256* ]]; then
-                log "WARNING: Failed to get SCRAM hash for user $username. Using plain password as fallback."
-                echo "$PG_PASSWORD"
-                return 1
+            if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
+                echo "$hash"
+                return 0
             fi
             
-            echo "$hash"
+            # If both methods failed, use plain text password as last resort
+            log "WARNING: Failed to get SCRAM hash for user $username. Using plain password as fallback."
+            echo "$PG_PASSWORD"
+            return 1
         else
             log "WARNING: PG_PASSWORD not set, cannot generate hash for $username"
             return 1
@@ -542,11 +554,7 @@ configure_pgbouncer() {
     
     # Ensure postgres user has access to pg_shadow for auth_query
     log "Ensuring postgres user has appropriate permissions for auth_query"
-    if [ -n "$PG_PASSWORD" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
-    else
-        log "WARNING: PG_PASSWORD not set, cannot ensure permissions"
-    fi
+    sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
     
     # Create a backup of PgBouncer configuration if it exists
     if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
@@ -661,19 +669,16 @@ EOF
     
     # Verify the auth_query setup
     log "Verifying PostgreSQL permissions for auth_query"
-    if [ -n "$PG_PASSWORD" ]; then
-        # Check permissions using PGPASSWORD to avoid prompts
-        has_permission=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')")
-        
-        if [ "$has_permission" != "t" ]; then
-            log "WARNING: postgres user does not have SELECT permission on pg_shadow."
-            log "Granting necessary permissions for auth_query"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
-        else
-            log "postgres user has proper permissions for auth_query"
-        fi
+    
+    # Check permissions using peer authentication to avoid password issues
+    has_permission=$(sudo -u postgres psql -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')")
+    
+    if [ "$has_permission" != "t" ]; then
+        log "WARNING: postgres user does not have SELECT permission on pg_shadow."
+        log "Granting necessary permissions for auth_query"
+        sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
     else
-        log "WARNING: PG_PASSWORD not set, cannot verify permissions"
+        log "postgres user has proper permissions for auth_query"
     fi
     
     # Restart PgBouncer to apply changes
@@ -805,7 +810,7 @@ create_demo_database() {
     # Create demo database
     log "Creating demo database"
     if [ "$(get_postgres_result "SELECT 1 FROM pg_database WHERE datname='$db_name'")" != "1" ]; then
-        run_postgres_command "CREATE DATABASE $db_name"
+        sudo -u postgres psql -c "CREATE DATABASE $db_name"
         log "Demo database created"
     else
         log "Demo database already exists"
@@ -814,15 +819,15 @@ create_demo_database() {
     # Create demo user
     log "Creating demo user"
     if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='$user_name'")" != "1" ]; then
-        run_postgres_command "CREATE USER $user_name WITH PASSWORD '$password'"
+        sudo -u postgres psql -c "CREATE USER $user_name WITH PASSWORD '$password'"
         log "Demo user created"
     else
-        run_postgres_command "ALTER USER $user_name WITH PASSWORD '$password'"
+        sudo -u postgres psql -c "ALTER USER $user_name WITH PASSWORD '$password'"
         log "Demo user password updated"
     fi
     
     # Grant privileges
-    run_postgres_command "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name"
     log "Privileges granted to demo user"
     
     log "Demo database and user created"
@@ -1167,20 +1172,29 @@ run_postgres_command() {
     local command="$1"
     local db_name="${2:-postgres}"  # Default to postgres database
     
-    # Only try running with PGPASSWORD, never fall back to prompting
+    # First try with peer authentication
+    sudo -u postgres psql -d "$db_name" -c "$command" 2>/dev/null
+    local result=$?
+    
+    # If command successful, return
+    if [ $result -eq 0 ]; then
+        return 0
+    fi
+    
+    # Try running with PGPASSWORD if peer auth failed
     if [ -n "$PG_PASSWORD" ]; then
         PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "$command" 2>/dev/null
-        local result=$?
+        result=$?
         
         if [ $result -eq 0 ]; then
             return 0
         else
-            log "ERROR: Failed to execute PostgreSQL command with PGPASSWORD"
+            log "ERROR: Failed to execute PostgreSQL command with both peer and password auth"
             log "Command was: $command"
             return $result
         fi
     else
-        log "ERROR: PG_PASSWORD not set, cannot execute PostgreSQL command"
+        log "ERROR: PG_PASSWORD not set and peer auth failed, cannot execute PostgreSQL command"
         log "Command was: $command"
         return 1
     fi
@@ -1191,21 +1205,31 @@ get_postgres_result() {
     local query="$1"
     local db_name="${2:-postgres}"  # Default to postgres database
     
-    # Only try running with PGPASSWORD, never fall back to prompting
+    # First try with peer authentication
+    local result=$(sudo -u postgres psql -d "$db_name" -tAc "$query" 2>/dev/null)
+    local exit_code=$?
+    
+    # If command successful, return result
+    if [ $exit_code -eq 0 ]; then
+        echo "$result"
+        return 0
+    fi
+    
+    # Try running with PGPASSWORD if peer auth failed
     if [ -n "$PG_PASSWORD" ]; then
-        local result=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -tAc "$query" 2>/dev/null)
-        local exit_code=$?
+        result=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -tAc "$query" 2>/dev/null)
+        exit_code=$?
         
         if [ $exit_code -eq 0 ]; then
             echo "$result"
             return 0
         else
-            log "ERROR: Failed to execute PostgreSQL query with PGPASSWORD"
+            log "ERROR: Failed to execute PostgreSQL query with both peer and password auth"
             log "Query was: $query"
             return $exit_code
         fi
     else
-        log "ERROR: PG_PASSWORD not set, cannot execute PostgreSQL query"
+        log "ERROR: PG_PASSWORD not set and peer auth failed, cannot execute PostgreSQL query"
         log "Query was: $query"
         return 1
     fi
