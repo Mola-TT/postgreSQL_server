@@ -913,10 +913,15 @@ create_demo_database() {
                 log "ERROR: Still could not drop user. Will continue with creating a new database."
                 # Force drop and recreate the database as last resort
                 log "Force dropping and recreating the demo database as last resort"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
-                    SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';
-                    DROP DATABASE IF EXISTS $db_name;
-                " || true
+                # First terminate connections
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';" || true
+                
+                # Drop database with FORCE option (outside transaction, requires PostgreSQL 13+)
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE IF EXISTS $db_name WITH (FORCE);" || {
+                    # Alternative approach with dropdb command-line utility if psql fails
+                    log "Trying alternative approach to drop database"
+                    PGPASSWORD="$PG_PASSWORD" dropdb -h localhost -U postgres --if-exists "$db_name" || true
+                }
             }
         fi
     fi
@@ -933,6 +938,20 @@ create_demo_database() {
     
     # Create demo user with limited privileges (NOINHERIT prevents inheriting permissions from PUBLIC role)
     log "Creating demo user with restricted permissions"
+    # Add a final check and aggressive DROP USER CASCADE before creating to absolutely ensure it doesn't exist
+    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
+        log "Demo user STILL exists after cleanup attempts. Using final aggressive approach."
+        # Try to drop any remaining dependencies and the user with CASCADE
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;" || true
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER $user_name CASCADE;" || true
+        # Last resort - if we still can't drop the user, create a new user with a timestamp
+        if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
+            log "WARNING: Could not drop demo user. Creating new user with timestamp suffix."
+            user_name="${user_name}_$(date +%s)"
+            log "New username: $user_name"
+        fi
+    fi
+    # Now create the user
     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE USER $user_name WITH PASSWORD '$password' NOINHERIT NOCREATEDB NOCREATEROLE;"
     log "Demo user created with restricted permissions"
     
