@@ -115,8 +115,8 @@ BEGIN
                  current_db, hostname, allowed_hostname;
     
     -- Check if hostname exactly matches the allowed hostname
-    -- Previously we were just checking if the allowed hostname was contained in the hostname
-    -- Now we require an exact match to prevent access via main domain
+    -- FIXED: Using exact match (!=) instead of partial match (position)
+    -- to prevent accessing via main domain instead of subdomain
     IF hostname IS NULL OR hostname = '' OR hostname != allowed_hostname THEN
         -- Unauthorized hostname
         RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %', 
@@ -148,6 +148,7 @@ BEGIN
     allowed_hostname := '$subdomain.$domain';
     
     -- Check if hostname exactly matches the allowed hostname
+    -- FIXED: Using exact match (!=) instead of partial match
     IF hostname IS NULL OR hostname = '' OR hostname != allowed_hostname THEN
         -- Unauthorized hostname
         RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %. (Query blocked)', 
@@ -341,8 +342,8 @@ BEGIN
                 
                 -- Check if this mapping applies to the current database
                 IF split_part(mapping.content, '' '', 1) = current_db THEN
-                    -- Check if hostname exactly matches allowed pattern
-                    -- Updated to require exact match
+                    -- FIXED: Check if hostname exactly matches allowed pattern
+                    -- Using != instead of position() to require exact match
                     IF hostname != allowed_hostname THEN
                         -- Unauthorized hostname
                         RAISE EXCEPTION ''Access to database "%s" is only permitted through subdomain: %s'', 

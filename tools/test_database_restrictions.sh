@@ -177,31 +177,64 @@ test_subdomain_access() {
     
     # Test connection with correct hostname
     log "Testing connection with correct hostname"
-    if [ "$user" == "postgres" ]; then
-        PGAPPNAME="$allowed_hostname" sudo -u postgres psql -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+    
+    # Save detailed output for debugging if in verbose mode
+    local correct_output=""
+    if $VERBOSE; then
+        if [ "$user" == "postgres" ]; then
+            correct_output=$(PGAPPNAME="$allowed_hostname" sudo -u postgres psql -c "SELECT current_database(), current_user, application_name;" "$db_name" 2>&1)
+        else
+            correct_output=$(PGAPPNAME="$allowed_hostname" PGPASSWORD="${PGPASSWORD:-}" psql -U "$user" -h localhost -c "SELECT current_database(), current_user, application_name;" "$db_name" 2>&1)
+        fi
+        log "Connection output with correct hostname:"
+        echo "$correct_output"
     else
-        PGAPPNAME="$allowed_hostname" PGPASSWORD="${PGPASSWORD:-}" psql -U "$user" -h localhost -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+        # Just test connection status without verbose output
+        if [ "$user" == "postgres" ]; then
+            PGAPPNAME="$allowed_hostname" sudo -u postgres psql -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+        else
+            PGAPPNAME="$allowed_hostname" PGPASSWORD="${PGPASSWORD:-}" psql -U "$user" -h localhost -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+        fi
     fi
     
     if [ $? -eq 0 ]; then
         log "SUCCESS: Connection through correct hostname '$allowed_hostname' works"
     else
         log "WARNING: Could not connect through correct hostname '$allowed_hostname'"
+        log "This suggests that hostname validation may be rejecting valid connections."
+        log "Check that the hostname map configuration is set up correctly."
     fi
     
     # Test connection with incorrect hostname
     local incorrect_hostname="dbhub.cc"
     log "Testing connection with incorrect hostname"
+    
+    # Capture connection attempt output for debugging
+    local result=0
+    local incorrect_output=""
+    
     if [ "$user" == "postgres" ]; then
-        PGAPPNAME="$incorrect_hostname" sudo -u postgres psql -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+        incorrect_output=$(PGAPPNAME="$incorrect_hostname" sudo -u postgres psql -c "SELECT current_database(), application_name;" "$db_name" 2>&1)
+        result=$?
     else
-        PGAPPNAME="$incorrect_hostname" PGPASSWORD="${PGPASSWORD:-}" psql -U "$user" -h localhost -c "SELECT current_database()" "$db_name" >/dev/null 2>&1
+        incorrect_output=$(PGAPPNAME="$incorrect_hostname" PGPASSWORD="${PGPASSWORD:-}" psql -U "$user" -h localhost -c "SELECT current_database(), application_name;" "$db_name" 2>&1)
+        result=$?
     fi
     
-    if [ $? -ne 0 ]; then
+    if [ $result -ne 0 ]; then
         log "SUCCESS: Connection through incorrect hostname '$incorrect_hostname' is properly blocked"
+        if $VERBOSE; then
+            log "Error message from connection attempt:"
+            echo "$incorrect_output" | grep -i "error\|exception\|permitted"
+        fi
     else
         log "WARNING: Connection through incorrect hostname '$incorrect_hostname' was NOT blocked"
+        log "This is a security issue! The database should only be accessible through its designated subdomain."
+        log "Check that exact hostname validation is enabled."
+        if $VERBOSE; then
+            log "Output from successful connection that should have been blocked:"
+            echo "$incorrect_output"
+        fi
     fi
 }
 

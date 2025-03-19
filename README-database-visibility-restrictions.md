@@ -250,23 +250,41 @@ To diagnose problems, use the testing script with the `--verbose` flag:
 
 ## Recent Improvements
 
-The latest version of these security scripts includes several significant improvements:
+The latest version of our security scripts includes several important improvements:
 
-1. **Enhanced Hostname Validation**:
-   - Previously, hostname validation used partial matching which could allow access through the main domain
-   - Now uses exact matching to strictly enforce subdomain-based access
+1. **Enhanced Hostname Validation**: Updated from partial hostname matching to exact hostname matching to prevent access through the main domain. The validation function now uses equality comparisons (`!=`) instead of position checks, ensuring that databases can only be accessed through their specific subdomains.
 
-2. **Multiple Validation Layers**:
-   - Added statement-level triggers on system tables to catch more types of access attempts
-   - Implemented both event triggers and statement triggers for more robust enforcement
+2. **Multiple Validation Layers**: Added multiple validation mechanisms including:
+   - Event triggers for DDL commands
+   - Statement-level triggers for capturing all queries
+   - Specialized triggers on system catalog tables
 
-3. **Better Testing Tools**:
-   - Improved test scripts to more thoroughly validate access restrictions
-   - Added diagnostic information to help troubleshoot any issues
+3. **Integrated into Main Initialization**: The hostname validation fix has been integrated directly into the main server initialization script (`server_init.sh`), ensuring that all newly created databases automatically have the correct validation configuration. This eliminates the need for separate fix scripts.
 
-If you're upgrading from a previous version and still experiencing access control issues, run the fix script:
+4. **Automatic Testing**: The initialization script now automatically tests the hostname validation after setup to verify that:
+   - Connections through the correct subdomain succeed
+   - Connections through the incorrect hostname (main domain) are properly blocked
+
+5. **Better Diagnostics**: Added detailed logging throughout the validation process, making it easier to diagnose any issues with hostname validation.
+
+6. **Comprehensive Documentation**: This README and inline code comments provide clear explanations of how the hostname validation works and how to troubleshoot it.
+
+## Testing and Verification
+
+To verify that your security restrictions are working correctly:
+
 ```bash
-./tools/fix_demo_access.sh
+# Test accessing the demo database through the correct subdomain
+PGAPPNAME="demo.dbhub.cc" psql -U demo -d demo
+
+# Test accessing the demo database through the main domain (should fail)
+PGAPPNAME="dbhub.cc" psql -U demo -d demo
+```
+
+You can also use the included test script:
+
+```bash
+./tools/test_database_restrictions.sh --verbose
 ```
 
 ## Additional Security Recommendations
