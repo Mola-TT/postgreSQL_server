@@ -159,6 +159,18 @@ if ! pg_isready -q; then
     exit 1
 fi
 
+# First, ensure global restrictions are applied
+if [ -f "../modules/postgresql.sh" ]; then
+    log "Applying global database visibility restrictions"
+    . "../modules/postgresql.sh"
+    configure_database_visibility_restrictions
+    
+    # Update pg_hba.conf for stricter subdomain-based access
+    update_pg_hba_for_subdomain_access
+else
+    log "WARNING: Cannot find ../modules/postgresql.sh, skipping global restrictions"
+fi
+
 # If a specific database was specified
 if [ -n "$DATABASE" ]; then
     # Check if database exists
@@ -216,6 +228,18 @@ if ! $TEST_MODE; then
     fi
     
     log "PostgreSQL configuration reloaded"
+    
+    # Restart PostgreSQL to fully apply all changes, especially trigger functions
+    # This is necessary because some changes won't take effect until a restart
+    log "Restarting PostgreSQL to fully apply changes"
+    if command -v pg_ctlcluster >/dev/null 2>&1; then
+        pg_version=$(psql --version | head -n 1 | sed 's/^.* \([0-9]\+\.[0-9]\+\).*$/\1/')
+        pg_ctlcluster "$pg_version" main restart
+    else
+        systemctl restart postgresql
+    fi
+    
+    log "PostgreSQL restarted successfully"
 fi
 
 log "Update script completed"

@@ -238,9 +238,35 @@ When implementing these security features, you may encounter these common issues
    - Run them with proper privileges (some operations may require root or postgres user)
    - Check the PostgreSQL version compatibility
 
+4. **Subdomain Access Control Bypass**: If databases can still be accessed through the main domain:
+   - Run the fix script to apply stricter hostname validation: `./tools/fix_demo_access.sh`
+   - The fix enhances hostname validation to require an exact match rather than a partial match
+   - This prevents access via the main domain when a subdomain is required
+
 To diagnose problems, use the testing script with the `--verbose` flag:
 ```bash
 ./tools/test_database_restrictions.sh --verbose
+```
+
+## Recent Improvements
+
+The latest version of these security scripts includes several significant improvements:
+
+1. **Enhanced Hostname Validation**:
+   - Previously, hostname validation used partial matching which could allow access through the main domain
+   - Now uses exact matching to strictly enforce subdomain-based access
+
+2. **Multiple Validation Layers**:
+   - Added statement-level triggers on system tables to catch more types of access attempts
+   - Implemented both event triggers and statement triggers for more robust enforcement
+
+3. **Better Testing Tools**:
+   - Improved test scripts to more thoroughly validate access restrictions
+   - Added diagnostic information to help troubleshoot any issues
+
+If you're upgrading from a previous version and still experiencing access control issues, run the fix script:
+```bash
+./tools/fix_demo_access.sh
 ```
 
 ## Additional Security Recommendations

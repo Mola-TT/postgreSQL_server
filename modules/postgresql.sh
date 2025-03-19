@@ -83,7 +83,7 @@ EOF
     return 0
 }
 
-# Configure database-specific connection restrictions
+# Configure database-specific connection restrictions with additional safeguards
 configure_db_connection_restrictions() {
     local db_name="$1"
     local subdomain="$2"
@@ -114,8 +114,10 @@ BEGIN
     RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
                  current_db, hostname, allowed_hostname;
     
-    -- Check if hostname matches allowed pattern
-    IF position(allowed_hostname in hostname) = 0 THEN
+    -- Check if hostname exactly matches the allowed hostname
+    -- Previously we were just checking if the allowed hostname was contained in the hostname
+    -- Now we require an exact match to prevent access via main domain
+    IF hostname IS NULL OR hostname = '' OR hostname != allowed_hostname THEN
         -- Unauthorized hostname
         RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %', 
                         current_db, allowed_hostname;
@@ -123,20 +125,86 @@ BEGIN
 END;
 \$\$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Create trigger for connection events
+-- Create a separate statement-level authentication check function that runs on every query
+CREATE OR REPLACE FUNCTION public.validate_hostname_on_query()
+RETURNS trigger AS \$\$
+DECLARE
+    hostname text;
+    current_db text;
+    allowed_hostname text;
+BEGIN
+    -- Skip for superuser
+    IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+        RETURN NULL;
+    END IF;
+    
+    -- Get the current hostname (from application_name)
+    SELECT application_name INTO hostname FROM pg_stat_activity WHERE pid = pg_backend_pid();
+    
+    -- Get current database name
+    SELECT current_database() INTO current_db;
+    
+    -- Determine allowed hostname based on database name
+    allowed_hostname := '$subdomain.$domain';
+    
+    -- Check if hostname exactly matches the allowed hostname
+    IF hostname IS NULL OR hostname = '' OR hostname != allowed_hostname THEN
+        -- Unauthorized hostname
+        RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %. (Query blocked)', 
+                        current_db, allowed_hostname;
+    END IF;
+    
+    -- Allow the query to proceed
+    RETURN NULL;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create event trigger for connection events
 DROP EVENT TRIGGER IF EXISTS connection_hostname_validation;
 CREATE EVENT TRIGGER connection_hostname_validation 
 ON ddl_command_start
 EXECUTE FUNCTION public.check_connection_hostname();
 
+-- First, remove any existing statement trigger if it exists
+DROP EVENT TRIGGER IF EXISTS query_hostname_validation;
+
+-- Create trigger on pg_class to capture all queries
+DROP TRIGGER IF EXISTS validate_hostname_on_query_trigger ON pg_class;
+CREATE TRIGGER validate_hostname_on_query_trigger
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE OR SELECT ON pg_class
+  FOR EACH STATEMENT
+  EXECUTE FUNCTION validate_hostname_on_query();
+
 -- Grant usage to public
 GRANT EXECUTE ON FUNCTION public.check_connection_hostname() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.validate_hostname_on_query() TO PUBLIC;
 EOF
     
     if [ $? -ne 0 ]; then
         log "ERROR: Failed to configure connection restrictions for database '$db_name'"
         return 1
     fi
+    
+    # Create a query-based validation on system catalogs to catch more types of access
+    sudo -u postgres psql -d "$db_name" << EOF
+-- Create validation triggers on common system catalogs to increase coverage
+DO \$\$
+DECLARE
+    tbl RECORD;
+BEGIN
+    FOR tbl IN SELECT tablename FROM pg_tables WHERE schemaname = 'pg_catalog' LIMIT 5
+    LOOP
+        EXECUTE format('
+            DROP TRIGGER IF EXISTS validate_hostname_trigger ON pg_catalog.%I;
+            CREATE TRIGGER validate_hostname_trigger
+              BEFORE SELECT ON pg_catalog.%I
+              FOR EACH STATEMENT
+              EXECUTE FUNCTION validate_hostname_on_query();
+        ', tbl.tablename, tbl.tablename);
+    END LOOP;
+END
+\$\$;
+EOF
     
     log "Connection restrictions configured for database '$db_name'"
     return 0
@@ -273,8 +341,9 @@ BEGIN
                 
                 -- Check if this mapping applies to the current database
                 IF split_part(mapping.content, '' '', 1) = current_db THEN
-                    -- Check if hostname matches allowed pattern
-                    IF position(allowed_hostname in hostname) = 0 THEN
+                    -- Check if hostname exactly matches allowed pattern
+                    -- Updated to require exact match
+                    IF hostname != allowed_hostname THEN
                         -- Unauthorized hostname
                         RAISE EXCEPTION ''Access to database "%s" is only permitted through subdomain: %s'', 
                                         current_db, allowed_hostname;
@@ -853,76 +922,6 @@ EOF
     
     # Return the user password
     echo "${user_password}"
-}
-
-# Function to configure database-specific connection restrictions
-configure_db_connection_restrictions() {
-    local db_name="$1"
-    local subdomain="$2"
-    
-    log "Configuring connection restrictions for database '$db_name' via subdomain '$subdomain'"
-    
-    # Check if PostgreSQL is running
-    if ! pg_isready -q; then
-        log "ERROR: PostgreSQL is not running, cannot configure connection restrictions"
-        return 1
-    fi
-    
-    # Create SQL script for connection restrictions
-    local SQL_SCRIPT="/tmp/configure_db_connections_${db_name}.sql"
-    
-    cat > "$SQL_SCRIPT" << EOF
--- Create database-specific connection restrictions
-\c ${db_name}
-
--- Prevent direct connections through the main domain for regular users
-CREATE OR REPLACE FUNCTION public.check_connection_hostname()
-RETURNS TRIGGER AS \$\$
-DECLARE
-    client_addr text;
-    client_hostname text;
-    expected_hostname text;
-BEGIN
-    -- Skip check for superuser
-    IF (SELECT usesuper FROM pg_catalog.pg_user WHERE usename = SESSION_USER) THEN
-        RETURN NEW;
-    END IF;
-    
-    -- Get client information
-    client_addr := inet_client_addr();
-    client_hostname := inet_client_hostname();
-    expected_hostname := '${subdomain}.${DOMAIN_SUFFIX}';
-    
-    -- Check if hostname matches expected value
-    IF client_hostname IS NULL OR client_hostname != expected_hostname THEN
-        RAISE EXCEPTION 'Access to database "${db_name}" is only allowed through subdomain "${subdomain}.${DOMAIN_SUFFIX}"';
-    END IF;
-    
-    RETURN NEW;
-END;
-\$\$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Create trigger to validate connections
-DROP TRIGGER IF EXISTS check_connection_hostname_trigger ON public.pg_class;
-CREATE TRIGGER check_connection_hostname_trigger
-    BEFORE SELECT ON public.pg_class
-    FOR EACH STATEMENT
-    EXECUTE FUNCTION public.check_connection_hostname();
-
--- Set a reminder message for all users connecting to this database
-ALTER DATABASE ${db_name} SET client_min_messages TO 'notice';
-COMMENT ON DATABASE ${db_name} IS 'Access only allowed through ${subdomain}.${DOMAIN_SUFFIX}';
-
-EOF
-    
-    # Execute the SQL script
-    log "Applying connection restrictions for database $db_name"
-    sudo -u postgres psql -f "$SQL_SCRIPT"
-    
-    # Clean up
-    rm -f "$SQL_SCRIPT"
-    
-    log "Database connection restrictions configured successfully"
 }
 
 # Function to create a new database with restricted visibility
