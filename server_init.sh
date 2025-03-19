@@ -525,75 +525,19 @@ configure_pgbouncer() {
         log "SSL certificates already exist"
     fi
     
-    # Function to get SCRAM hash for PostgreSQL user
-    get_user_hash() {
-        local username="$1"
-        
-        # Try using PGPASSWORD to avoid password prompts
-        if [ -n "$PG_PASSWORD" ]; then
-            local hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
-            
-            # Check if we got a valid hash
-            if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
-                echo "$hash"
-                return 0
-            fi
-            
-            # If the above failed, try the peer auth method as fallback
-            hash=$(sudo -u postgres psql -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
-            
-            # Check if we got a valid hash with peer auth
-            if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
-                echo "$hash"
-                return 0
-            fi
-            
-            # If both methods failed, use plain text password as last resort
-            log "WARNING: Failed to get SCRAM hash for user $username. Using plain password as fallback."
-            echo "$PG_PASSWORD"
-            return 1
-        else
-            log "WARNING: PG_PASSWORD not set, cannot generate hash for $username"
-            return 1
-        fi
-    }
-    
-    # Ensure postgres user has access to pg_shadow for auth_query
-    log "Ensuring postgres user has appropriate permissions for auth_query"
-    if [ -n "$PG_PASSWORD" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
-    else
-        # Try with peer authentication as fallback
-        sudo -u postgres psql -c "ALTER USER postgres WITH SUPERUSER;"
-    fi
-    
-    # Create a backup of PgBouncer configuration if it exists
-    if [ -f "/etc/pgbouncer/pgbouncer.ini" ]; then
-        BACKUP_FILE="/etc/pgbouncer/pgbouncer.ini.$(date +'%Y%m%d%H%M%S').bak"
-        log "Creating backup of existing PgBouncer configuration: $BACKUP_FILE"
-        cp "/etc/pgbouncer/pgbouncer.ini" "$BACKUP_FILE"
-    fi
-    
-    # Create a backup of userlist.txt if it exists
-    if [ -f "/etc/pgbouncer/userlist.txt" ]; then
-        USERLIST_BACKUP="/etc/pgbouncer/userlist.txt.$(date +'%Y%m%d%H%M%S').bak"
-        log "Creating backup of existing PgBouncer userlist: $USERLIST_BACKUP"
-        cp "/etc/pgbouncer/userlist.txt" "$USERLIST_BACKUP"
-    fi
-    
-    # Configure PgBouncer - updated with admin_users and stats_users using proper quoting
+    # Configure PgBouncer - updated to use MD5 authentication which is more compatible
     log "Creating PgBouncer configuration"
     cat > "/etc/pgbouncer/pgbouncer.ini" << EOF
 [databases]
 * = host=localhost port=5432
-postgres = host=localhost port=5432 dbname=postgres user=postgres password=$PG_PASSWORD
+postgres = host=localhost port=5432 dbname=postgres user=postgres
 
 [pgbouncer]
 logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
 listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
-auth_type = plain
+auth_type = md5
 auth_file = /etc/pgbouncer/userlist.txt
 admin_users = postgres
 stats_users = postgres
@@ -617,27 +561,12 @@ client_tls_key_file = /etc/postgresql/ssl/server.key
 client_tls_cert_file = /etc/postgresql/ssl/server.crt
 EOF
     
-    # Create log directory for PgBouncer if it doesn't exist
-    log "Ensuring PgBouncer log directory exists"
-    mkdir -p /var/log/postgresql
-    touch /var/log/postgresql/pgbouncer.log
-    chown postgres:postgres /var/log/postgresql/pgbouncer.log
+    # Create new PgBouncer userlist with MD5 hashes
+    log "Creating new PgBouncer userlist with MD5 passwords"
     
-    # Create run directory for PgBouncer if it doesn't exist
-    log "Ensuring PgBouncer run directory exists"
-    mkdir -p /var/run/postgresql
-    chown postgres:postgres /var/run/postgresql
-    
-    log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
-    log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
-    log "PgBouncer authentication set to plain for better compatibility"
-    log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
-    
-    # Create new PgBouncer userlist with plain passwords
-    log "Creating new PgBouncer userlist with plain passwords"
-    
-    # Use plain text password for postgres user
-    echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
+    # Generate MD5 hash for postgres user in the format pgbouncer expects
+    PG_MD5_PASSWORD=$(echo -n "md5$(echo -n "${PG_PASSWORD}postgres" | md5sum | cut -d ' ' -f 1)")
+    echo "\"postgres\" \"$PG_MD5_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
     log "Successfully added postgres user to PgBouncer userlist"
     
     # Add demo user if exists
@@ -646,7 +575,8 @@ EOF
         # Use PGPASSWORD to check if demo user exists
         if [ -n "$PG_PASSWORD" ]; then
             if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'" 2>/dev/null)" = "1" ]; then
-                echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
+                DEMO_MD5_PASSWORD=$(echo -n "md5$(echo -n "${DEMO_DB_PASSWORD}${DEMO_DB_USER}" | md5sum | cut -d ' ' -f 1)")
+                echo "\"${DEMO_DB_USER}\" \"$DEMO_MD5_PASSWORD\"" >> "/etc/pgbouncer/userlist.txt"
                 log "Demo user added to PgBouncer userlist"
             else
                 log "Demo user not found in PostgreSQL, skipping"
@@ -654,7 +584,8 @@ EOF
         else
             # Fallback to using get_postgres_result
             if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'")" = "1" ]; then
-                echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
+                DEMO_MD5_PASSWORD=$(echo -n "md5$(echo -n "${DEMO_DB_PASSWORD}${DEMO_DB_USER}" | md5sum | cut -d ' ' -f 1)")
+                echo "\"${DEMO_DB_USER}\" \"$DEMO_MD5_PASSWORD\"" >> "/etc/pgbouncer/userlist.txt"
                 log "Demo user added to PgBouncer userlist"
             else
                 log "Demo user not found in PostgreSQL, skipping"
@@ -670,13 +601,16 @@ EOF
     
     # Verify userlist.txt is not empty
     if [ ! -s "/etc/pgbouncer/userlist.txt" ]; then
-        log "WARNING: PgBouncer userlist.txt is empty. Creating with plain text password as fallback."
-        echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
+        log "WARNING: PgBouncer userlist.txt is empty. Creating with MD5 password as fallback."
+        echo "\"postgres\" \"$PG_MD5_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
         chown postgres:postgres /etc/pgbouncer/userlist.txt
         chmod 640 /etc/pgbouncer/userlist.txt
     fi
     
-    log "PgBouncer configuration complete"
+    log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
+    log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
+    log "PgBouncer authentication set to MD5 for better compatibility"
+    log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
     # Verify the auth_query setup
     log "Verifying PostgreSQL permissions for auth_query"
