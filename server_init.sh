@@ -525,7 +525,7 @@ configure_pgbouncer() {
         log "SSL certificates already exist"
     fi
     
-    # Configure PgBouncer to use SCRAM-SHA-256 for compatibility with PostgreSQL
+    # Configure PgBouncer to use plain text authentication for better compatibility
     log "Creating PgBouncer configuration"
     cat > "/etc/pgbouncer/pgbouncer.ini" << EOF
 [databases]
@@ -537,10 +537,8 @@ logfile = /var/log/postgresql/pgbouncer.log
 pidfile = /var/run/postgresql/pgbouncer.pid
 listen_addr = *
 listen_port = ${PGBOUNCER_PORT:-6432}
-auth_type = scram-sha-256
+auth_type = plain
 auth_file = /etc/pgbouncer/userlist.txt
-auth_query = SELECT usename, passwd FROM pg_shadow WHERE usename=\$1
-auth_user = postgres
 admin_users = postgres
 stats_users = postgres
 pool_mode = ${POOL_MODE:-transaction}
@@ -563,77 +561,17 @@ client_tls_key_file = /etc/postgresql/ssl/server.key
 client_tls_cert_file = /etc/postgresql/ssl/server.crt
 EOF
     
-    # Create new PgBouncer userlist with SCRAM-SHA-256 hashes
-    log "Creating new PgBouncer userlist with SCRAM-SHA-256 hashes"
+    # Create PgBouncer userlist with plain text passwords for simplicity
+    log "Creating PgBouncer userlist with plain text passwords"
     
-    # Function to get SCRAM hash for PostgreSQL user
-    get_user_hash() {
-        local username="$1"
-        
-        # Try using PGPASSWORD to avoid password prompts
-        if [ -n "$PG_PASSWORD" ]; then
-            local hash=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
-            
-            # Check if we got a valid hash
-            if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
-                echo "$hash"
-                return 0
-            fi
-            
-            # If the above failed, try the peer auth method as fallback
-            hash=$(sudo -u postgres psql -tAc "SELECT concat('SCRAM-SHA-256$', split_part(rolpassword, '$', 2), '$', split_part(rolpassword, '$', 3), '$', split_part(rolpassword, '$', 4)) FROM pg_authid WHERE rolname='$username'" 2>/dev/null)
-            
-            # Check if we got a valid hash with peer auth
-            if [ -n "$hash" ] && [[ "$hash" == SCRAM-SHA-256* ]]; then
-                echo "$hash"
-                return 0
-            fi
-            
-            # If both methods failed, use plain text password as last resort
-            log "WARNING: Failed to get SCRAM hash for user $username. Using plain password as fallback."
-            echo "$PG_PASSWORD"
-            return 1
-        else
-            log "WARNING: PG_PASSWORD not set, cannot generate hash for $username"
-            return 1
-        fi
-    }
+    # Write postgres user to userlist
+    echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
     
-    # Get postgres user hash
-    POSTGRES_PASSWORD_HASH=$(get_user_hash "postgres")
-    
-    # Check if hash generation was successful
-    if [[ "$POSTGRES_PASSWORD_HASH" == SCRAM-SHA-256* ]]; then
-        log "Successfully generated SCRAM hash for postgres user"
-        echo "\"postgres\" \"$POSTGRES_PASSWORD_HASH\"" > "/etc/pgbouncer/userlist.txt"
-    else
-        log "WARNING: Failed to generate SCRAM hash. Using plain text password as fallback."
-        # Use plain text password as fallback (less secure but more compatible)
-        echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
-    fi
-    
-    # Add demo user if exists
-    if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ]; then
+    # Add demo user if it exists
+    if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ] && [ -n "${DEMO_DB_PASSWORD}" ]; then
         log "Adding demo user to PgBouncer userlist"
-        # Use PGPASSWORD to check if demo user exists
-        if [ -n "$PG_PASSWORD" ]; then
-            if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'" 2>/dev/null)" = "1" ]; then
-                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
-                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> "/etc/pgbouncer/userlist.txt"
-                log "Demo user added to PgBouncer userlist"
-            else
-                log "Demo user not found in PostgreSQL, skipping"
-            fi
-        else
-            # Fallback to using get_postgres_result
-            if [ "$(get_postgres_result "SELECT 1 FROM pg_roles WHERE rolname='${DEMO_DB_USER}'")" = "1" ]; then
-                DEMO_PASSWORD_HASH=$(get_user_hash "${DEMO_DB_USER}")
-                echo "\"${DEMO_DB_USER}\" \"$DEMO_PASSWORD_HASH\"" >> "/etc/pgbouncer/userlist.txt"
-                log "Demo user added to PgBouncer userlist"
-            else
-                log "Demo user not found in PostgreSQL, skipping"
-            fi
-        fi
+        echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
+        log "Demo user added to PgBouncer userlist"
     fi
     
     # Set permissions
@@ -652,7 +590,7 @@ EOF
     
     log "PgBouncer configured to listen on all interfaces (listen_addr = *)"
     log "PgBouncer SSL support enabled with client_tls_sslmode = allow"
-    log "PgBouncer authentication set to SCRAM-SHA-256 for better compatibility"
+    log "PgBouncer authentication set to plain text for simplicity and reliability"
     log "PgBouncer configured to ignore unsupported startup parameter: extra_float_digits"
     
     # Verify the auth_query setup
@@ -692,14 +630,17 @@ EOF
         journalctl -u pgbouncer --no-pager -n 20 || true
         
         # Check for specific SCRAM authentication errors
-        if grep -q "cannot do SCRAM authentication" /var/log/postgresql/pgbouncer.log 2>/dev/null; then
-            log "Detected SCRAM authentication issue. Trying alternative configuration..."
+        if grep -q "cannot do SCRAM authentication" /var/log/postgresql/pgbouncer.log 2>/dev/null || grep -q "SASL authentication failed" /var/log/postgresql/pgbouncer.log 2>/dev/null || grep -q "password authentication failed" /var/log/postgresql/pgbouncer.log 2>/dev/null; then
+            log "Detected authentication issue. Trying alternative configuration..."
             
             # Fallback to plain text authentication as last resort
-            log "Switching to plain text authentication as fallback"
+            log "Verifying plain text authentication is configured"
             sed -i 's/auth_type = scram-sha-256/auth_type = plain/' /etc/pgbouncer/pgbouncer.ini
+            sed -i '/auth_query/d' /etc/pgbouncer/pgbouncer.ini
+            sed -i '/auth_user/d' /etc/pgbouncer/pgbouncer.ini
             
             # Update userlist.txt to use plain text passwords
+            log "Updating userlist.txt with plain text passwords"
             echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
             if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ] && [ -n "${DEMO_DB_PASSWORD}" ]; then
                 echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
@@ -711,6 +652,26 @@ EOF
             
             log "Trying to restart PgBouncer with plain text authentication..."
             systemctl restart pgbouncer
+            
+            # If still failing, try more diagnostics
+            if ! systemctl status pgbouncer | grep -q "active (running)"; then
+                log "PgBouncer still failing to start. Checking for additional issues..."
+                
+                # Check PostgreSQL connectivity
+                log "Testing PostgreSQL connectivity..."
+                if ! PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT 1" postgres; then
+                    log "WARNING: Cannot connect to PostgreSQL with provided password. This may cause PgBouncer authentication issues."
+                    log "Attempting to reset PostgreSQL password..."
+                    sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '$PG_PASSWORD';"
+                    
+                    # Update userlist again after password reset
+                    echo "\"postgres\" \"$PG_PASSWORD\"" > "/etc/pgbouncer/userlist.txt"
+                    chown postgres:postgres /etc/pgbouncer/userlist.txt
+                    chmod 640 /etc/pgbouncer/userlist.txt
+                    
+                    systemctl restart pgbouncer
+                fi
+            fi
         else
             # Try running PgBouncer directly with verbose output
             log "Running PgBouncer directly for debugging:"
