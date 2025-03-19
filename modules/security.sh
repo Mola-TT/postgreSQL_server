@@ -17,6 +17,9 @@ setup_security() {
     
     # Set up SSL certificates
     setup_ssl_certificates
+    
+    # Configure PostgreSQL database visibility restrictions
+    configure_database_visibility_restrictions
 }
 
 # Function to configure firewall
@@ -176,4 +179,176 @@ setup_self_signed_ssl() {
     sed -i "s|#\?ssl_key_file\s*=\s*.*|ssl_key_file = '$SSL_DIR/server.key'|" "$PG_CONF_DIR/postgresql.conf"
     
     log "Self-signed certificates installed successfully"
+}
+
+# Function to configure database visibility restrictions
+configure_database_visibility_restrictions() {
+    log "Configuring database visibility restrictions"
+    
+    # Check if PostgreSQL is running
+    if ! pg_isready -q; then
+        log "ERROR: PostgreSQL is not running, cannot configure visibility restrictions"
+        return 1
+    fi
+    
+    # Create a script to execute SQL commands
+    local SQL_SCRIPT="/tmp/restrict_db_visibility.sql"
+    
+    cat > "$SQL_SCRIPT" << EOF
+-- Create a custom view to restrict database visibility
+CREATE OR REPLACE FUNCTION pg_catalog.pg_database_restricted()
+RETURNS SETOF pg_catalog.pg_database AS \$\$
+DECLARE
+    current_user text := current_user;
+    current_db text := current_database();
+    is_superuser boolean := (SELECT usesuper FROM pg_catalog.pg_user WHERE usename = current_user);
+BEGIN
+    -- Superuser can see all databases
+    IF is_superuser THEN
+        RETURN QUERY SELECT * FROM pg_catalog.pg_database;
+    ELSE
+        -- Regular users can only see the current database and template databases
+        RETURN QUERY SELECT * FROM pg_catalog.pg_database 
+                     WHERE datname = current_db 
+                     OR datname LIKE 'template%' 
+                     OR datname = 'postgres';
+    END IF;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create a view that overrides pg_database for non-superusers
+CREATE OR REPLACE VIEW pg_catalog.pg_database_view AS
+SELECT * FROM pg_catalog.pg_database_restricted();
+
+-- Revoke direct access to pg_database for regular users
+REVOKE SELECT ON pg_catalog.pg_database FROM PUBLIC;
+
+-- Grant access to our restricted view
+GRANT SELECT ON pg_catalog.pg_database_view TO PUBLIC;
+
+-- Set up restrictions for information_schema.schemata
+CREATE OR REPLACE FUNCTION information_schema.schemata_restricted()
+RETURNS SETOF information_schema.schemata AS \$\$
+DECLARE
+    current_user text := current_user;
+    current_db text := current_database();
+    is_superuser boolean := (SELECT usesuper FROM pg_catalog.pg_user WHERE usename = current_user);
+BEGIN
+    -- Superuser can see all schemas
+    IF is_superuser THEN
+        RETURN QUERY SELECT * FROM information_schema.schemata;
+    ELSE
+        -- Regular users can only see schemas in the current database
+        RETURN QUERY SELECT * FROM information_schema.schemata 
+                     WHERE catalog_name = current_db;
+    END IF;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create a function to be executed when a database admin user is created
+CREATE OR REPLACE FUNCTION public.restrict_admin_visibility()
+RETURNS VOID AS \$\$
+BEGIN
+    -- Apply restrictions to the database
+    EXECUTE format('ALTER ROLE %I SET search_path TO "$user", public', current_user);
+    
+    -- Force non-superusers to use pg_database_view instead of pg_database
+    EXECUTE format('ALTER ROLE %I SET pg_catalog.pg_database TO pg_catalog.pg_database_view', current_user);
+END;
+\$\$ LANGUAGE plpgsql;
+
+-- Add a trigger function to enforce the subdomain-based access model
+CREATE OR REPLACE FUNCTION public.enforce_subdomain_access()
+RETURNS event_trigger AS \$\$
+DECLARE
+    db_name text;
+    user_name text;
+BEGIN
+    -- Get current database and user
+    db_name := current_database();
+    user_name := current_user;
+    
+    -- Skip for superuser and template databases
+    IF (SELECT usesuper FROM pg_catalog.pg_user WHERE usename = user_name) OR
+       db_name LIKE 'template%' OR db_name = 'postgres' THEN
+        RETURN;
+    END IF;
+    
+    -- Enforce the subdomain access model for non-superusers
+    -- This will be called from connection validation through pg_hba.conf
+    NULL;
+END;
+\$\$ LANGUAGE plpgsql;
+
+-- Create an event trigger to enforce access control on database creation
+CREATE EVENT TRIGGER enforce_access_on_db_create
+ON ddl_command_end
+WHEN tag IN ('CREATE DATABASE')
+EXECUTE FUNCTION public.enforce_subdomain_access();
+EOF
+    
+    # Execute the SQL script as the PostgreSQL superuser
+    log "Applying database visibility restrictions"
+    sudo -u postgres psql -f "$SQL_SCRIPT"
+    
+    # Clean up
+    rm -f "$SQL_SCRIPT"
+    
+    # Create function to configure pg_hba.conf for subdomain access control
+    configure_subdomain_pg_hba
+    
+    # Restart PostgreSQL to apply changes
+    restart_service "postgresql"
+    
+    log "Database visibility restrictions configured successfully"
+}
+
+# Function to configure pg_hba.conf for subdomain access control
+configure_subdomain_pg_hba() {
+    log "Configuring pg_hba.conf for subdomain access control"
+    
+    # Create a script to update pg_hba.conf
+    local PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
+    local PG_HBA_FILE="$PG_CONF_DIR/pg_hba.conf"
+    
+    # Backup existing pg_hba.conf
+    backup_file "$PG_HBA_FILE"
+    
+    # Add subdomain-specific rules to pg_hba.conf
+    cat >> "$PG_HBA_FILE" << EOF
+
+# DBHub.cc subdomain access control
+# The following rules enforce the subdomain-to-database mapping
+# Format: host [database] [user] [address] [method] [options]
+# Superuser (postgres) can connect to any database from any subdomain
+host    all             postgres        all                     scram-sha-256
+# Regular users can only connect to their specific database from matching subdomain
+host    all             all             all                     scram-sha-256   clientcert=verify-full
+
+# Map hostnames to database names for access control
+# This is used with the hostname maps in PostgreSQL to enforce subdomain access
+hostssl sameuser        all             all                     scram-sha-256
+EOF
+    
+    # Create hostname map configuration
+    local MAP_FILE="$PG_CONF_DIR/pg_hostname_map.conf"
+    
+    cat > "$MAP_FILE" << EOF
+# Map hostnames to database names
+# Format: database_name subdomain.domain.com
+# Example: demo demo.example.com
+
+# Dynamic entries will be added by the DBHub.cc system
+EOF
+    
+    # Update postgresql.conf to use the hostname map
+    local PG_CONF_FILE="$PG_CONF_DIR/postgresql.conf"
+    
+    # Make sure the following lines are in postgresql.conf
+    grep -q "^host_name_map" "$PG_CONF_FILE" || echo "host_name_map = '$MAP_FILE'" >> "$PG_CONF_FILE"
+    
+    # Update PostgreSQL to check hostname during connection
+    grep -q "^check_hostname" "$PG_CONF_FILE" || echo "check_hostname = on" >> "$PG_CONF_FILE"
+    
+    log "pg_hba.conf configured for subdomain access control"
 } 

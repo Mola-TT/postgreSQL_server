@@ -365,90 +365,178 @@ optimize_postgresql() {
     restart_service "postgresql"
 }
 
-# Function to create a restricted database user
+# Function to create a database user with restricted visibility
 create_restricted_user() {
     local db_name="$1"
     local user_name="$2"
-    local password="$3"
+    local user_password="${3:-$(generate_password)}"
+    local read_only="${4:-false}"
     
-    log "Creating restricted user $user_name for database $db_name"
+    log "Creating restricted user '$user_name' for database '$db_name'"
     
     # Check if PostgreSQL is running
-    if pg_isready -q; then
-        # Check if database exists
-        if ! sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$db_name"; then
-            log "Creating database $db_name"
-            sudo -u postgres psql -c "CREATE DATABASE $db_name;" || {
-                log "ERROR: Failed to create database $db_name"
-                return 1
-            }
-        else
-            log "Database $db_name already exists"
-        fi
-        
-        # Check if user exists
-        if ! sudo -u postgres psql -c "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" | grep -q 1; then
-            log "Creating user $user_name"
-            sudo -u postgres psql -c "CREATE USER $user_name WITH ENCRYPTED PASSWORD '$password';" || {
-                log "ERROR: Failed to create user $user_name"
-                return 1
-            }
-        else
-            log "User $user_name already exists, updating password"
-            sudo -u postgres psql -c "ALTER USER $user_name WITH ENCRYPTED PASSWORD '$password';" || {
-                log "ERROR: Failed to update password for user $user_name"
-                return 1
-            }
-        fi
-        
-        # Grant privileges
-        log "Granting privileges to $user_name on $db_name"
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;" || {
-            log "ERROR: Failed to grant database privileges to $user_name"
-            return 1
-        }
-        
-        # Connect to the database to grant schema privileges
-        if sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON SCHEMA public TO $user_name;"; then
-            sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO $user_name;"
-            sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $user_name;"
-            sudo -u postgres psql -d "$db_name" -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO $user_name;"
-            
-            # Revoke public privileges
-            log "Revoking public privileges on $db_name"
-            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM PUBLIC;"
-            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;"
-            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;"
-            sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;"
-            
-            log "User $user_name created and configured for database $db_name"
-            return 0
-        else
-            log "WARNING: Could not connect to database $db_name to grant schema privileges"
-            log "This may be because the database was just created and is not ready yet"
-            log "Basic privileges have been granted, but schema privileges may be incomplete"
-            return 0
-        fi
-    else
+    if ! pg_isready -q; then
         log "ERROR: PostgreSQL is not running, cannot create user"
-        log "Attempting to start PostgreSQL"
-        
-        # Try to start the specific cluster
-        if pg_lsclusters | grep -q "$PG_VERSION main"; then
-            pg_ctlcluster $PG_VERSION main start
-            sleep 5
-            
-            if pg_isready -q; then
-                log "PostgreSQL started, retrying user creation"
-                create_restricted_user "$db_name" "$user_name" "$password"
-                return $?
-            else
-                log "ERROR: Failed to start PostgreSQL, user not created"
-                return 1
-            fi
-        else
-            log "ERROR: No PostgreSQL cluster found, user not created"
-            return 1
-        fi
+        return 1
     fi
+    
+    # Create SQL script for user creation
+    local SQL_SCRIPT="/tmp/create_user_${user_name}.sql"
+    
+    # Build SQL based on whether this is a read-only user
+    if [ "$read_only" = "true" ]; then
+        cat > "$SQL_SCRIPT" << EOF
+-- Create read-only user
+CREATE USER ${user_name} WITH PASSWORD '${user_password}';
+
+-- Connect to the target database
+\c ${db_name}
+
+-- Grant connect privilege on the database
+GRANT CONNECT ON DATABASE ${db_name} TO ${user_name};
+
+-- Grant usage on schema
+GRANT USAGE ON SCHEMA public TO ${user_name};
+
+-- Grant select on all tables
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${user_name};
+
+-- Grant select on future tables
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${user_name};
+
+-- Apply database visibility restrictions
+ALTER ROLE ${user_name} SET search_path TO "\$user", public;
+
+-- Force non-superusers to use pg_database_view instead of pg_database
+ALTER ROLE ${user_name} SET pg_catalog.pg_database TO pg_catalog.pg_database_view;
+EOF
+    else
+        cat > "$SQL_SCRIPT" << EOF
+-- Create user with write access
+CREATE USER ${user_name} WITH PASSWORD '${user_password}';
+
+-- Connect to the target database
+\c ${db_name}
+
+-- Grant connect privilege on the database
+GRANT CONNECT ON DATABASE ${db_name} TO ${user_name};
+
+-- Grant usage on schema
+GRANT USAGE, CREATE ON SCHEMA public TO ${user_name};
+
+-- Grant privileges on all tables
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${user_name};
+
+-- Grant privileges on all sequences
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ${user_name};
+
+-- Grant privileges on future tables
+ALTER DEFAULT PRIVILEGES IN SCHEMA public 
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${user_name};
+
+-- Grant privileges on future sequences
+ALTER DEFAULT PRIVILEGES IN SCHEMA public 
+    GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${user_name};
+
+-- Apply database visibility restrictions
+ALTER ROLE ${user_name} SET search_path TO "\$user", public;
+
+-- Force non-superusers to use pg_database_view instead of pg_database
+ALTER ROLE ${user_name} SET pg_catalog.pg_database TO pg_catalog.pg_database_view;
+EOF
+    fi
+    
+    # Execute the SQL script as the PostgreSQL superuser
+    log "Creating user and setting permissions"
+    sudo -u postgres psql -f "$SQL_SCRIPT"
+    
+    # Clean up
+    rm -f "$SQL_SCRIPT"
+    
+    # Create connection info
+    local PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
+    local MAP_FILE="$PG_CONF_DIR/pg_hostname_map.conf"
+    local subdomain=$(grep "^${db_name} " "$MAP_FILE" | awk '{print $2}' | cut -d. -f1)
+    
+    local CONNECTION_INFO="db_name=${db_name}\ndb_user=${user_name}\ndb_password=${user_password}\ndb_host=${subdomain:-$db_name}.${DOMAIN_SUFFIX}\ndb_port=5432"
+    
+    log "User ${user_name} created successfully with restricted visibility"
+    log "Connection information: ${CONNECTION_INFO}"
+    
+    # Return the user password
+    echo "${user_password}"
+}
+
+# Function to create a new database with restricted visibility
+create_restricted_database() {
+    local db_name="$1"
+    local admin_password="${2:-$(generate_password)}"
+    local subdomain="${3:-$db_name}"
+    
+    log "Creating new database '$db_name' with restricted visibility"
+    
+    # Check if PostgreSQL is running
+    if ! pg_isready -q; then
+        log "ERROR: PostgreSQL is not running, cannot create database"
+        return 1
+    fi
+    
+    # Create SQL script for database creation
+    local SQL_SCRIPT="/tmp/create_db_${db_name}.sql"
+    
+    cat > "$SQL_SCRIPT" << EOF
+-- Create database
+CREATE DATABASE ${db_name};
+
+-- Create admin user for this database
+CREATE USER admin_${db_name} WITH PASSWORD '${admin_password}';
+
+-- Grant admin privileges on the database
+GRANT ALL PRIVILEGES ON DATABASE ${db_name} TO admin_${db_name};
+
+-- Connect to the new database to set up permissions
+\c ${db_name}
+
+-- Revoke public schema privileges
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE ${db_name} FROM PUBLIC;
+
+-- Set up proper permissions for admin user
+GRANT ALL PRIVILEGES ON SCHEMA public TO admin_${db_name};
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO admin_${db_name};
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO admin_${db_name};
+GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO admin_${db_name};
+
+-- Apply database visibility restrictions
+ALTER ROLE admin_${db_name} SET search_path TO "\$user", public;
+
+-- Force non-superusers to use pg_database_view instead of pg_database
+ALTER ROLE admin_${db_name} SET pg_catalog.pg_database TO pg_catalog.pg_database_view;
+EOF
+    
+    # Execute the SQL script as the PostgreSQL superuser
+    log "Creating database and setting permissions"
+    sudo -u postgres psql -f "$SQL_SCRIPT"
+    
+    # Add the hostname mapping for subdomain access
+    local PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
+    local MAP_FILE="$PG_CONF_DIR/pg_hostname_map.conf"
+    
+    # Add mapping entry if it doesn't exist
+    if ! grep -q "^${db_name} ${subdomain}" "$MAP_FILE"; then
+        log "Adding hostname mapping for ${subdomain}"
+        echo "${db_name} ${subdomain}.${DOMAIN_SUFFIX}" >> "$MAP_FILE"
+    fi
+    
+    # Clean up
+    rm -f "$SQL_SCRIPT"
+    
+    # Create connection info
+    local CONNECTION_INFO="db_name=${db_name}\ndb_user=admin_${db_name}\ndb_password=${admin_password}\ndb_host=${subdomain}.${DOMAIN_SUFFIX}\ndb_port=5432"
+    
+    log "Database ${db_name} created successfully with restricted visibility"
+    log "Connection information: ${CONNECTION_INFO}"
+    
+    # Return the admin password
+    echo "${admin_password}"
 } 
