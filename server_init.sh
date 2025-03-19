@@ -1126,7 +1126,7 @@ run_postgres_command() {
     
     # Try running with PGPASSWORD
     if [ -n "$PG_PASSWORD" ]; then
-        PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -d "$db_name" -c "$command" 2>/dev/null
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "$command" 2>/dev/null
         local result=$?
         
         # If command successful, return
@@ -1136,7 +1136,7 @@ run_postgres_command() {
     fi
     
     # Otherwise fall back to direct command (may prompt for password)
-    sudo -u postgres psql -d "$db_name" -c "$command"
+    psql -h localhost -U postgres -d "$db_name" -c "$command"
     return $?
 }
 
@@ -1147,7 +1147,7 @@ get_postgres_result() {
     
     # Try running with PGPASSWORD
     if [ -n "$PG_PASSWORD" ]; then
-        local result=$(PGPASSWORD="$PG_PASSWORD" sudo -u postgres psql -d "$db_name" -tAc "$query" 2>/dev/null)
+        local result=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -tAc "$query" 2>/dev/null)
         local exit_code=$?
         
         # If command successful, return result
@@ -1158,7 +1158,7 @@ get_postgres_result() {
     fi
     
     # Otherwise fall back to direct command (may prompt for password)
-    sudo -u postgres psql -d "$db_name" -tAc "$query"
+    psql -h localhost -U postgres -d "$db_name" -tAc "$query"
     return $?
 }
 
