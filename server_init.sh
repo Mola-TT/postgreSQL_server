@@ -786,8 +786,35 @@ create_demo_database() {
     # First drop the user if it exists to ensure clean permissions (drop owned objects first)
     log "Checking if demo user exists"
     if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
-        log "Demo user already exists, dropping owned objects and user for clean slate"
+        log "Demo user already exists, transferring database ownership and dropping user"
+        
+        # First change ownership of the database to postgres if it exists
+        if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
+            log "Changing ownership of $db_name database to postgres"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
+        fi
+        
+        # Revoke all privileges from the user on all databases
+        log "Revoking privileges for $user_name on all databases"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL PRIVILEGES ON DATABASE $db_name FROM $user_name;"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL PRIVILEGES ON DATABASE postgres FROM $user_name;"
+        
+        # Terminate all connections from the user 
+        log "Terminating all connections from $user_name"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = '$user_name';"
+        
+        # Check if role owns any objects in the demo database and reassign them to postgres
+        if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
+            log "Reassigning owned objects in $db_name database to postgres"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;" || true
+        fi
+        
+        # Drop owned by user in postgres database
+        log "Dropping owned objects for $user_name in postgres database"
         PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
+        
+        # Now drop the user
+        log "Dropping user $user_name"
         PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP USER IF EXISTS $user_name;"
     fi
     
