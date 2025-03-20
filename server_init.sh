@@ -962,9 +962,78 @@ END;
 \$\$;
 EOF
                 
+                # Ultra-aggressive dependency removal approach
+                log "Using aggressive dependency removal approach..."
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
+DO \$\$
+DECLARE
+    obj record;
+    dep record;
+BEGIN
+    -- Identify and fix all objects that depend on the role
+    FOR obj IN 
+        SELECT DISTINCT 
+            cl.oid as objoid,
+            cl.relname as objname, 
+            n.nspname as schema
+        FROM pg_class cl
+        JOIN pg_namespace n ON cl.relnamespace = n.oid
+        JOIN pg_depend d ON d.objid = cl.oid
+        JOIN pg_authid a ON d.refobjid = a.oid
+        WHERE a.rolname = '$role_name'
+        AND n.nspname NOT LIKE 'pg_%'
+    LOOP
+        -- For each object, change its owner to postgres
+        BEGIN
+            EXECUTE format('ALTER %s %I.%I OWNER TO postgres', 
+                          CASE 
+                            WHEN EXISTS (SELECT 1 FROM pg_tables WHERE schemaname=obj.schema AND tablename=obj.objname) THEN 'TABLE'
+                            WHEN EXISTS (SELECT 1 FROM pg_views WHERE schemaname=obj.schema AND viewname=obj.objname) THEN 'VIEW'
+                            WHEN EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace=n.oid 
+                                        WHERE n.nspname=obj.schema AND t.typname=obj.objname) THEN 'TYPE'
+                            ELSE 'TABLE'
+                          END,
+                          obj.schema, obj.objname);
+            RAISE NOTICE 'Changed owner of %.% to postgres', obj.schema, obj.objname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not change owner of %.%: %', obj.schema, obj.objname, SQLERRM;
+        END;
+    END LOOP;
+    
+    -- Try to clean up functions owned by the role
+    FOR obj IN 
+        SELECT p.oid, p.proname, n.nspname as schema
+        FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE p.proowner = (SELECT oid FROM pg_authid WHERE rolname = '$role_name')
+        AND n.nspname NOT LIKE 'pg_%'
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER FUNCTION %I.%I() OWNER TO postgres', obj.schema, obj.proname);
+            RAISE NOTICE 'Changed owner of function %.% to postgres', obj.schema, obj.proname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not change owner of function %.%: %', obj.schema, obj.proname, SQLERRM;
+        END;
+    END LOOP;
+    
+    -- Try to clean up acess privileges referencing this role
+    EXECUTE 'UPDATE pg_class SET relacl = NULL WHERE relacl::text LIKE ''%' || '$role_name' || '%''';
+    EXECUTE 'UPDATE pg_proc SET proacl = NULL WHERE proacl::text LIKE ''%' || '$role_name' || '%''';
+    EXECUTE 'UPDATE pg_namespace SET nspacl = NULL WHERE nspacl::text LIKE ''%' || '$role_name' || '%''';
+    EXECUTE 'UPDATE pg_type SET typacl = NULL WHERE typacl::text LIKE ''%' || '$role_name' || '%''';
+    
+    -- Final DROP OWNED attempt
+    BEGIN
+        EXECUTE 'DROP OWNED BY $role_name CASCADE';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Final DROP OWNED failed: %', SQLERRM;
+    END;
+END \$\$;
+EOF
+
                 # Try dropping the role one final time
                 PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
-                
+
                 # If it still fails, warn but continue with script
                 if [ $? -ne 0 ]; then
                     log "WARNING: Unable to drop role $role_name despite multiple attempts. This may leave orphaned objects."
@@ -1988,12 +2057,20 @@ BEGIN
     
     -- Log connection attempt for debugging
     RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
-                  current_db, hostname, allowed_hostname;
+                 current_db, hostname, allowed_hostname;
     
-    -- Check hostname only if it's provided (more relaxed for local tools)
+    -- Allow connections from psql and localhost for testing purposes
+    -- For production, set SESSION_PRELOAD_LIBRARIES to auto_explain to track connections
     IF hostname IS NOT NULL AND hostname != '' AND hostname != allowed_hostname THEN
-        RAISE WARNING 'Access to database \"%\" is recommended through subdomain: %', 
-                       current_db, allowed_hostname;
+        -- Use warning instead of exception for psql/local connections
+        IF hostname = 'psql' OR hostname LIKE '%local%' THEN
+            RAISE WARNING 'Using local psql connection to database \"%\". In production, access is permitted only through subdomain: %', 
+                        current_db, allowed_hostname;
+        ELSE
+            -- Only raise exception for non-psql connections with wrong hostname
+            RAISE EXCEPTION 'Access to database \"%\" is only permitted through subdomain: %', 
+                        current_db, allowed_hostname;
+        END IF;
     END IF;
 END;
 \$\$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -2026,9 +2103,6 @@ BEGIN
     RETURN NEW;
 END;
 \$\$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Add the function to login roles
-ALTER ROLE ${db_name}_admin SET session_preload_libraries = 'auto_explain';
 "
 }
 
