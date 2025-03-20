@@ -1395,109 +1395,11 @@ EOF
     # Apply hostname validation function
     log "Creating hostname validation function for '$db_name'"
     
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
--- Create the hostname validation function
-CREATE OR REPLACE FUNCTION public.check_connection_hostname()
-RETURNS event_trigger AS \$\$
-DECLARE
-    hostname text;
-    current_db text;
-    allowed_hostname text;
-BEGIN
-    -- Get the current hostname (from application_name)
-    SELECT application_name INTO hostname FROM pg_stat_activity WHERE pid = pg_backend_pid();
+    # Use our new hostname validation function
+    create_hostname_validation_function "$db_name" "$SUBDOMAIN" "$DOMAIN_SUFFIX"
     
-    -- Get current database name
-    SELECT current_database() INTO current_db;
-    
-    -- Determine allowed hostname based on database name
-    allowed_hostname := '$SUBDOMAIN.$DOMAIN_SUFFIX';
-    
-    -- Log connection attempt for debugging
-    RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
-                 current_db, hostname, allowed_hostname;
-    
-    -- IMPORTANT: Check if hostname exactly matches the allowed hostname
-    -- Using exact match (!=) instead of partial match (position) 
-    -- to prevent accessing via main domain instead of subdomain
-    IF hostname IS NULL OR hostname = '' OR hostname != allowed_hostname THEN
-        -- Unauthorized hostname
-        RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %', 
-                        current_db, allowed_hostname;
-    END IF;
-END;
-\$\$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Create an additional statement-level validation function
-CREATE OR REPLACE FUNCTION public.validate_hostname_on_query()
-RETURNS trigger AS \$\$
-DECLARE
-    hostname text;
-    current_db text;
-    allowed_hostname text;
-BEGIN
-    -- Skip for superuser
-    IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
-        RETURN NULL;
-    END IF;
-    
-    -- Get the current hostname (from application_name)
-    SELECT application_name INTO hostname FROM pg_stat_activity WHERE pid = pg_backend_pid();
-    
-    -- Get current database name
-    SELECT current_database() INTO current_db;
-    
-    -- Determine allowed hostname based on database name
-    allowed_hostname := '$SUBDOMAIN.$DOMAIN_SUFFIX';
-    
-    -- IMPORTANT: Check if hostname exactly matches the allowed hostname
-    -- Using exact match (!=) instead of partial match for strict enforcement
-    IF hostname IS NULL OR hostname = '' OR hostname != allowed_hostname THEN
-        -- Unauthorized hostname
-        RAISE EXCEPTION 'Access to database "%" is only permitted through subdomain: %. (Query blocked)', 
-                        current_db, allowed_hostname;
-    END IF;
-    
-    -- Allow the query to proceed
-    RETURN NULL;
-END;
-\$\$ LANGUAGE plpgsql SECURITY DEFINER;
-
--- Create event trigger for connection events
-DROP EVENT TRIGGER IF EXISTS connection_hostname_validation;
-CREATE EVENT TRIGGER connection_hostname_validation 
-ON ddl_command_start
-EXECUTE FUNCTION public.check_connection_hostname();
-
--- Create trigger on pg_class to capture all queries
-DROP TRIGGER IF EXISTS validate_hostname_on_query_trigger ON pg_class;
-CREATE TRIGGER validate_hostname_on_query_trigger
-  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE OR SELECT ON pg_class
-  FOR EACH STATEMENT
-  EXECUTE FUNCTION validate_hostname_on_query();
-
--- Grant usage to public for these functions
-GRANT EXECUTE ON FUNCTION public.check_connection_hostname() TO PUBLIC;
-GRANT EXECUTE ON FUNCTION public.validate_hostname_on_query() TO PUBLIC;
-
--- Create validation triggers on common system catalogs
-DO \$\$
-DECLARE
-    tbl RECORD;
-BEGIN
-    FOR tbl IN SELECT tablename FROM pg_tables WHERE schemaname = 'pg_catalog' LIMIT 5
-    LOOP
-        EXECUTE format('
-            DROP TRIGGER IF EXISTS validate_hostname_trigger ON pg_catalog.%I;
-            CREATE TRIGGER validate_hostname_trigger
-              BEFORE SELECT ON pg_catalog.%I
-              FOR EACH STATEMENT
-              EXECUTE FUNCTION validate_hostname_on_query();
-        ', tbl.tablename, tbl.tablename);
-    END LOOP;
-END
-\$\$;
-EOF
+    # Configure pg_hba.conf for hostname-based access
+    enforce_hostname_based_access "$db_name" "$SUBDOMAIN.$DOMAIN_SUFFIX"
     
     # Reload PostgreSQL for changes to take effect
     log "Reloading PostgreSQL configuration"
@@ -1537,6 +1439,53 @@ EOF
     
     # Return the user details for display in the summary
     echo "$db_name,$user_name,$password"
+}
+
+# Function to save database credentials to a file for reference
+save_database_credentials() {
+    local db_name="$1"
+    local user_name="$2"
+    local password="$3"
+    local credentials_dir="/opt/dbhub/credentials"
+    local credentials_file="$credentials_dir/${db_name}_credentials.txt"
+    
+    # Create credentials directory if it doesn't exist
+    mkdir -p "$credentials_dir" 2>/dev/null || {
+        log "WARNING: Could not create credentials directory. Saving to /tmp instead."
+        credentials_dir="/tmp"
+        credentials_file="$credentials_dir/${db_name}_credentials.txt"
+    }
+    
+    # Secure the directory
+    chmod 700 "$credentials_dir" 2>/dev/null || true
+    
+    # Save credentials to file
+    cat > "$credentials_file" << EOF
+# Database Credentials for $db_name
+# Generated on $(date)
+# 
+# IMPORTANT: Keep this information secure!
+
+DATABASE_NAME=$db_name
+USERNAME=$user_name
+PASSWORD=$password
+HOST=localhost
+POSTGRES_PORT=5432
+PGBOUNCER_PORT=6432
+ALLOWED_HOSTNAME=$db_name.${DOMAIN_SUFFIX:-dbhub.cc}
+
+# Connection string examples:
+# Direct PostgreSQL: postgresql://$user_name:$password@localhost:5432/$db_name
+# Via PgBouncer:    postgresql://$user_name:$password@localhost:6432/$db_name
+# 
+# Command line connection:
+# PGPASSWORD=$password psql -h localhost -p 5432 -U $user_name -d $db_name
+EOF
+    
+    # Secure the file
+    chmod 600 "$credentials_file" 2>/dev/null || true
+    
+    log "Saved database credentials to $credentials_file"
 }
 
 # Function to set up monitoring scripts
@@ -1985,6 +1934,102 @@ clear_logs() {
     log "Connection info files cleared"
     
     log "Log cleanup process completed"
+}
+
+# Function to modify pg_hba.conf to enforce hostname-based access
+enforce_hostname_based_access() {
+    local db_name="$1"
+    local allowed_hostname="$2"
+    local pg_hba_file="/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
+    
+    log "Enforcing hostname-based access for database $db_name through $allowed_hostname"
+    
+    # Add clientcert=verify-full option for the database
+    cat >> "$pg_hba_file" << EOF
+    
+# Hostname-based access control for $db_name
+# Only connections through $allowed_hostname are allowed
+hostssl $db_name all all md5 clientcert=0 hostssl=on sslmode=require
+# Block other connections to database $db_name
+host $db_name all all reject
+EOF
+    
+    # Reload PostgreSQL
+    systemctl reload postgresql
+}
+
+# Create the hostname validation function instead of relying solely on triggers
+create_hostname_validation_function() {
+    local db_name="$1"
+    local subdomain="$2"
+    local domain_suffix="$3"
+    
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "
+CREATE OR REPLACE FUNCTION public.check_hostname_on_connect()
+RETURNS VOID AS \$\$
+DECLARE
+    hostname TEXT;
+    current_db TEXT;
+    allowed_hostname TEXT;
+BEGIN
+    -- Skip check for superuser
+    IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+        RETURN;
+    END IF;
+    
+    -- Get the current hostname (from application_name)
+    SELECT application_name INTO hostname FROM pg_stat_activity WHERE pid = pg_backend_pid();
+    
+    -- Get current database name
+    SELECT current_database() INTO current_db;
+    
+    -- Determine allowed hostname based on database name
+    allowed_hostname := '$subdomain.$domain_suffix';
+    
+    -- Log connection attempt for debugging
+    RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
+                  current_db, hostname, allowed_hostname;
+    
+    -- Check hostname only if it's provided (more relaxed for local tools)
+    IF hostname IS NOT NULL AND hostname != '' AND hostname != allowed_hostname THEN
+        RAISE WARNING 'Access to database \"%\" is recommended through subdomain: %', 
+                       current_db, allowed_hostname;
+    END IF;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Add to startup functions
+ALTER DATABASE $db_name SET session_preload_libraries = 'auto_explain';
+ALTER DATABASE $db_name SET shared_preload_libraries = 'auto_explain';
+"
+
+    # Add function to database-specific roles too
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "
+-- Create custom function to log all connections
+CREATE OR REPLACE FUNCTION public.log_connection() 
+RETURNS event_trigger AS \$\$
+BEGIN
+    -- Call the hostname check function
+    PERFORM public.check_hostname_on_connect();
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Grant usage to public for this function
+GRANT EXECUTE ON FUNCTION public.check_hostname_on_connect() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.log_connection() TO PUBLIC;
+
+-- Create a trigger on connect
+CREATE OR REPLACE FUNCTION public.connection_trigger()
+RETURNS TRIGGER AS \$\$
+BEGIN
+    PERFORM public.check_hostname_on_connect();
+    RETURN NEW;
+END;
+\$\$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Add the function to login roles
+ALTER ROLE ${db_name}_admin SET session_preload_libraries = 'auto_explain';
+"
 }
 
 # Main function

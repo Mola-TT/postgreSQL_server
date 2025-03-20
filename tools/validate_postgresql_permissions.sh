@@ -306,7 +306,7 @@ test_demo_database() {
   if [ -z "$DEMO_DB_NAME" ] || [ -z "$DEMO_DB_USER" ] || [ -z "$DEMO_DB_PASSWORD" ]; then
     log "WARN" "Demo database credentials not fully defined in .env, skipping demo database tests"
     return 1
-  }
+  fi
 
   log "INFO" "Testing demo database permissions..."
   
