@@ -1028,11 +1028,10 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         RAISE NOTICE 'Final DROP OWNED failed: %', SQLERRM;
     END;
-END \$\$;
-EOF
+END \$\$;" "$db_name"
 
                 # Try dropping the role one final time
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
+                run_psql_silent "DROP ROLE IF EXISTS $role_name;"
 
                 # If it still fails, warn but continue with script
                 if [ $? -ne 0 ]; then
@@ -1048,7 +1047,7 @@ EOF
     # Check if role owns any objects in the demo database and reassign them to postgres
     if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
         log "Reassigning owned objects in $db_name database to postgres"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REASSIGN OWNED BY $user_name TO postgres;"
+        run_psql_silent "REASSIGN OWNED BY $user_name TO postgres;"
         PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;"
         
         log "Performing additional object cleanup in $db_name database"
@@ -2055,22 +2054,22 @@ BEGIN
     -- Determine allowed hostname based on database name
     allowed_hostname := '$subdomain.$domain_suffix';
     
-    -- Log connection attempt for debugging
-    RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
-                 current_db, hostname, allowed_hostname;
+    -- Log connection attempt for debugging (comment out for production)
+    -- RAISE NOTICE 'Connection attempt: database=%, hostname=%, allowed=%', 
+    --              current_db, hostname, allowed_hostname;
     
-    -- Allow connections from psql and localhost for testing purposes
-    -- For production, set SESSION_PRELOAD_LIBRARIES to auto_explain to track connections
-    IF hostname IS NOT NULL AND hostname != '' AND hostname != allowed_hostname THEN
-        -- Use warning instead of exception for psql/local connections
-        IF hostname = 'psql' OR hostname LIKE '%local%' THEN
-            RAISE WARNING 'Using local psql connection to database \"%\". In production, access is permitted only through subdomain: %', 
-                        current_db, allowed_hostname;
-        ELSE
-            -- Only raise exception for non-psql connections with wrong hostname
-            RAISE EXCEPTION 'Access to database \"%\" is only permitted through subdomain: %', 
-                        current_db, allowed_hostname;
-        END IF;
+    -- IMPORTANT: Allow connections from psql tool and local tools for testing
+    -- This check completely bypasses hostname validation for psql
+    IF hostname = 'psql' OR hostname LIKE '%local%' OR hostname IS NULL OR hostname = '' THEN
+        -- Allow psql connections without any warning for local development/testing
+        RETURN;
+    END IF;
+    
+    -- Only check hostname for non-psql connections
+    IF hostname != allowed_hostname THEN
+        -- Unauthorized hostname
+        RAISE EXCEPTION 'Access to database \"%\" is only permitted through subdomain: %', 
+                    current_db, allowed_hostname;
     END IF;
 END;
 \$\$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -2104,6 +2103,24 @@ BEGIN
 END;
 \$\$ LANGUAGE plpgsql SECURITY DEFINER;
 "
+}
+
+# Function to run psql commands with suppressed output
+run_psql_silent() {
+    local query="$1"
+    local db="${2:-postgres}"
+    
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "$query" > /dev/null 2>&1
+    return $?
+}
+
+# Function to run psql commands with minimal output (just query status)
+run_psql_quiet() {
+    local query="$1"
+    local db="${2:-postgres}"
+    
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "$query" | grep -v "^DROP\|^CREATE\|^ALTER\|^REVOKE\|^GRANT\|^NOTICE\|^DO\|^REASSIGN\|^SELECT\|^UPDATE"
+    return ${PIPESTATUS[0]}
 }
 
 # Main function
