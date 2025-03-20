@@ -6,7 +6,8 @@ nano .env
 chmod +x server_init.sh
 clear
 sudo ./server_init.sh install
-
+chmod +x tools/validate_postgresql_permissions.sh
+sudo ./tools/validate_postgresql_permissions.sh 
 
 Pull from remote regardless of changes
 git fetch origin
@@ -14,3 +15,5 @@ git reset --hard origin/main
 chmod +x server_init.sh
 clear
 sudo ./server_init.sh install
+chmod +x tools/validate_postgresql_permissions.sh
+sudo ./tools/validate_postgresql_permissions.sh 
