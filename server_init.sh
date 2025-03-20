@@ -833,212 +833,271 @@ create_demo_database() {
             if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
                 log "Checking for objects owned by $role_name in $db_name database"
                 
+                # Try with DROP OWNED BY first to reset dependency chain
+                log "Removing all objects owned by $role_name using DROP OWNED BY"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP OWNED BY $role_name CASCADE;" || true
+                
+                # Try to drop the role immediately after dropping owned objects
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;" && {
+                    log "Successfully dropped role $role_name after dropping owned objects"
+                    return 0
+                }
+                
+                # If drop still fails, try more aggressive approach with direct SQL 
+                log "Role still exists. Trying more aggressive approach to reassign ownership."
+                
                 # Reassign database ownership first if needed
                 if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name' AND datdba=(SELECT oid FROM pg_roles WHERE rolname='$role_name')" 2>/dev/null)" = "1" ]; then
                     log "Reassigning database ownership from $role_name to postgres"
                     PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
                 fi
                 
-                # Find and reassign ownership of schemas, tables, functions, etc.
-                log "Reassigning ownership of all objects owned by $role_name to postgres"
+                # Identify and fix any grants for the role that might be causing issues
+                log "Removing grants to/from the role"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $role_name;" || true
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $role_name;" || true
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM $role_name;" || true
+                
+                # Find dependent objects directly using detailed catalog queries
+                log "Finding and reassigning specific dependent objects"
                 PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
--- Reassign all objects owned by role to postgres
+-- Create a temporary function to identify and fix object dependencies
 DO \$\$
 DECLARE
     obj record;
+    dependent record;
+    cmd text;
 BEGIN
-    -- Reassign schema ownership
-    FOR obj IN SELECT nspname FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
+    -- List members of the role and remove them
+    FOR obj IN SELECT rolname FROM pg_roles WHERE pg_has_role(rolname, '$role_name', 'MEMBER')
     LOOP
-        EXECUTE format('ALTER SCHEMA %I OWNER TO postgres', obj.nspname);
-        RAISE NOTICE 'Changed ownership of schema % to postgres', obj.nspname;
+        EXECUTE 'REVOKE $role_name FROM ' || quote_ident(obj.rolname);
+        RAISE NOTICE 'Revoked membership from %', obj.rolname;
     END LOOP;
     
-    -- Reassign table ownership
-    FOR obj IN SELECT schemaname, tablename FROM pg_tables WHERE tableowner = '$role_name'
+    -- Reassign default privileges
+    FOR obj IN SELECT nspname, rolname FROM pg_namespace n, pg_roles r 
+              WHERE r.rolname = '$role_name'
     LOOP
-        EXECUTE format('ALTER TABLE %I.%I OWNER TO postgres', obj.schemaname, obj.tablename);
-        RAISE NOTICE 'Changed ownership of table %.% to postgres', obj.schemaname, obj.tablename;
+        BEGIN
+            EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE ' || quote_ident('$role_name') || 
+                    ' IN SCHEMA ' || quote_ident(obj.nspname) || ' GRANT ALL ON TABLES TO postgres';
+            RAISE NOTICE 'Altered default privileges in schema %', obj.nspname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error altering default privileges: %', SQLERRM;
+        END;
     END LOOP;
     
-    -- Reassign view ownership
-    FOR obj IN SELECT schemaname, viewname FROM pg_views WHERE viewowner = '$role_name'
+    -- Find and fix any foreign key constraints where the role is referenced
+    FOR obj IN SELECT conname, conrelid::regclass::text as tabname
+              FROM pg_constraint
+              WHERE contype = 'f' 
+              AND (conrelid::regclass::text IN 
+                   (SELECT tablename FROM pg_tables WHERE tableowner = '$role_name'))
     LOOP
-        EXECUTE format('ALTER VIEW %I.%I OWNER TO postgres', obj.schemaname, obj.viewname);
-        RAISE NOTICE 'Changed ownership of view %.% to postgres', obj.schemaname, obj.viewname;
+        BEGIN
+            EXECUTE 'ALTER TABLE ' || obj.tabname || ' DROP CONSTRAINT ' || quote_ident(obj.conname);
+            RAISE NOTICE 'Dropped foreign key constraint % on table %', obj.conname, obj.tabname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error dropping constraint: %', SQLERRM;
+        END;
     END LOOP;
     
-    -- Reassign function ownership
-    FOR obj IN SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) AS args
-        FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid
-        WHERE p.proowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
+    -- Reassign all objects of every type using pg_depend
+    FOR obj IN SELECT DISTINCT classid::regclass::text as objtype, objid::regclass::text as objname
+              FROM pg_depend d JOIN pg_authid a ON d.refobjid = a.oid
+              WHERE a.rolname = '$role_name'
+              AND classid::regclass::text NOT LIKE 'pg_%'
     LOOP
-        EXECUTE format('ALTER FUNCTION %I.%I(%s) OWNER TO postgres', 
-                      obj.nspname, obj.proname, obj.args);
-        RAISE NOTICE 'Changed ownership of function %.%(%s) to postgres', 
-                    obj.nspname, obj.proname, obj.args;
-    END LOOP;
-    
-    -- Reassign sequence ownership
-    FOR obj IN SELECT n.nspname, c.relname
-        FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
-        WHERE c.relkind = 'S' AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
-    LOOP
-        EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO postgres', obj.nspname, obj.relname);
-        RAISE NOTICE 'Changed ownership of sequence %.% to postgres', obj.nspname, obj.relname;
-    END LOOP;
-    
-    -- Reassign type ownership
-    FOR obj IN SELECT n.nspname, t.typname
-        FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid
-        WHERE t.typowner = (SELECT oid FROM pg_roles WHERE rolname = '$role_name')
-    LOOP
-        EXECUTE format('ALTER TYPE %I.%I OWNER TO postgres', obj.nspname, obj.typname);
-        RAISE NOTICE 'Changed ownership of type %.% to postgres', obj.nspname, obj.typname;
+        BEGIN
+            IF obj.objtype = 'pg_class' THEN
+                EXECUTE 'ALTER TABLE ' || obj.objname || ' OWNER TO postgres';
+                RAISE NOTICE 'Changed ownership of % to postgres', obj.objname;
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error changing ownership of %: %', obj.objname, SQLERRM;
+        END;
     END LOOP;
 END
 \$\$;
 EOF
+                
+                # Try one more DROP OWNED to be sure
+                log "Performing final DROP OWNED to clear any remaining dependencies"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $role_name CASCADE;" || true
+                
+                # Now try to drop the role again
+                log "Attempting to drop role after dependencies have been cleared"
             fi
             
             # Now try to drop the role
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
             
-            # If it still fails, force drop owned objects
+            # If it still fails, try one final approach
             if [ $? -ne 0 ]; then
-                log "Still unable to drop role due to dependencies. Trying DROP OWNED..."
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP OWNED BY $role_name CASCADE;"
+                log "Still unable to drop role due to dependencies. Using database-level approach..."
+                
+                # Try to force cascade drop at database level
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
+DO \$\$
+BEGIN
+    -- Try to revoke all privileges granted by the role
+    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM $role_name';
+    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM $role_name';
+    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM $role_name';
+    
+    -- Try to revoke all privileges granted to the role
+    EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE $db_name FROM $role_name';
+    EXECUTE 'REVOKE ALL PRIVILEGES ON SCHEMA public FROM $role_name';
+    
+    -- Final attempt to drop any owned objects
+    EXECUTE 'DROP OWNED BY $role_name CASCADE';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error during final cleanup: %', SQLERRM;
+END;
+\$\$;
+EOF
+                
+                # Try dropping the role one final time
                 PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
+                
+                # If it still fails, warn but continue with script
+                if [ $? -ne 0 ]; then
+                    log "WARNING: Unable to drop role $role_name despite multiple attempts. This may leave orphaned objects."
+                    log "WARNING: Proceeding with the rest of the script. Manual cleanup may be needed later."
+                else
+                    log "Successfully dropped role $role_name after extensive cleanup"
+                fi
             fi
         fi
+    fi
+    
+    # Check if role owns any objects in the demo database and reassign them to postgres
+    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
+        log "Reassigning owned objects in $db_name database to postgres"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REASSIGN OWNED BY $user_name TO postgres;"
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;"
         
-        # Check if role owns any objects in the demo database and reassign them to postgres
-        if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
-            log "Reassigning owned objects in $db_name database to postgres"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REASSIGN OWNED BY $user_name TO postgres;"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;"
-            
-            log "Performing additional object cleanup in $db_name database"
-            
-            # Find remaining objects owned by the user in the demo database
-            local objects_sql="SELECT nspname, relname, relkind FROM pg_class c
-                             JOIN pg_namespace n ON c.relnamespace = n.oid
-                             WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
-                             ORDER BY relkind, nspname, relname;"
-            
-            # Try to drop these objects - using -t (tuples only) and -A (unaligned) for clean output
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$objects_sql" | while read schema table kind; do
-                [ -z "$schema" ] && continue
-                
-                if [ "$kind" = "r" ]; then # regular table
-                    log "Dropping table $schema.$table owned by $user_name"
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP TABLE IF EXISTS $schema.$table CASCADE;"
-                elif [ "$kind" = "v" ]; then # view
-                    log "Dropping view $schema.$table owned by $user_name"
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP VIEW IF EXISTS $schema.$table CASCADE;"
-                elif [ "$kind" = "S" ]; then # sequence
-                    log "Dropping sequence $schema.$table owned by $user_name"
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP SEQUENCE IF EXISTS $schema.$table CASCADE;"
-                elif [ "$kind" = "i" ]; then # index
-                    log "Dropping index $schema.$table owned by $user_name"
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP INDEX IF EXISTS $schema.$table CASCADE;"
-                fi
-            done
-            
-            # Check for functions owned by the user
-            local functions_sql="SELECT nspname, proname FROM pg_proc p
-                              JOIN pg_namespace n ON p.pronamespace = n.oid
-                              WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
-                              ORDER BY nspname, proname;"
-            
-            # Try to drop these functions - using -t (tuples only) and -A (unaligned) for clean output
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$functions_sql" | while read schema func; do
-                [ -z "$schema" ] && continue
-                
-                log "Dropping function $schema.$func owned by $user_name"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP FUNCTION IF EXISTS $schema.$func CASCADE;"
-            done
-        fi
+        log "Performing additional object cleanup in $db_name database"
         
-        # Drop owned by user in postgres database
-        log "Dropping owned objects for $user_name in postgres database"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
+        # Find remaining objects owned by the user in the demo database
+        local objects_sql="SELECT nspname, relname, relkind FROM pg_class c
+                         JOIN pg_namespace n ON c.relnamespace = n.oid
+                         WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
+                         ORDER BY relkind, nspname, relname;"
         
-        # Try to drop the user directly first
-        log "Attempting to drop user $user_name"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" && {
-            log "User $user_name dropped successfully"
-        } || {
-            # Find and drop remaining dependencies in all databases
-            log "Scanning all databases for remaining dependencies"
-            for db in $(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0', 'template1') AND datistemplate = false;"); do
-                log "Checking database: $db"
-                
-                # If this is the demo database, try drastic measures - drop schemas owned by the user
-                if [ "$db" = "$db_name" ]; then
-                    log "Taking drastic measures in demo database"
-                    
-                    # Try to drop schemas
-                    local schemas=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -tAc "SELECT nspname FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name');")
-                    
-                    for schema in $schemas; do
-                        log "Dropping schema $schema owned by $user_name"
-                        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "DROP SCHEMA IF EXISTS $schema CASCADE;"
-                    done
-                    
-                    # Try again to drop role
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" && {
-                        log "User $user_name dropped successfully after schema cleanup"
-                        break
-                    }
-                fi
-                
-                # Try to reassign ownership and drop owned as a last resort
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "REASSIGN OWNED BY $user_name TO postgres; DROP OWNED BY $user_name CASCADE;" || true
-            done
+        # Try to drop these objects - using -t (tuples only) and -A (unaligned) for clean output
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$objects_sql" | while read schema table kind; do
+            [ -z "$schema" ] && continue
             
-            # Try once more to drop the role
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" || {
-                log "ERROR: Still could not drop user. Will continue with creating a new database."
-                # Force drop and recreate the database as last resort
-                log "Force dropping and recreating the demo database as last resort"
+            if [ "$kind" = "r" ]; then # regular table
+                log "Dropping table $schema.$table owned by $user_name"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP TABLE IF EXISTS $schema.$table CASCADE;"
+            elif [ "$kind" = "v" ]; then # view
+                log "Dropping view $schema.$table owned by $user_name"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP VIEW IF EXISTS $schema.$table CASCADE;"
+            elif [ "$kind" = "S" ]; then # sequence
+                log "Dropping sequence $schema.$table owned by $user_name"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP SEQUENCE IF EXISTS $schema.$table CASCADE;"
+            elif [ "$kind" = "i" ]; then # index
+                log "Dropping index $schema.$table owned by $user_name"
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP INDEX IF EXISTS $schema.$table CASCADE;"
+            fi
+        done
+        
+        # Check for functions owned by the user
+        local functions_sql="SELECT nspname, proname FROM pg_proc p
+                          JOIN pg_namespace n ON p.pronamespace = n.oid
+                          WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
+                          ORDER BY nspname, proname;"
+        
+        # Try to drop these functions - using -t (tuples only) and -A (unaligned) for clean output
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$functions_sql" | while read schema func; do
+            [ -z "$schema" ] && continue
+            
+            log "Dropping function $schema.$func owned by $user_name"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP FUNCTION IF EXISTS $schema.$func CASCADE;"
+        done
+    fi
+    
+    # Drop owned by user in postgres database
+    log "Dropping owned objects for $user_name in postgres database"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
+    
+    # Try to drop the user directly first
+    log "Attempting to drop user $user_name"
+    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" && {
+        log "User $user_name dropped successfully"
+    } || {
+        # Find and drop remaining dependencies in all databases
+        log "Scanning all databases for remaining dependencies"
+        for db in $(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0', 'template1') AND datistemplate = false;"); do
+            log "Checking database: $db"
+            
+            # If this is the demo database, try drastic measures - drop schemas owned by the user
+            if [ "$db" = "$db_name" ]; then
+                log "Taking drastic measures in demo database"
                 
-                # Generate a backup name for the database if we need to rename it
-                local timestamp=$(date +%Y%m%d%H%M%S)
-                local new_db_name="${db_name}_old_$timestamp"
+                # Try to drop schemas
+                local schemas=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -tAc "SELECT nspname FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name');")
                 
-                # Force drop database - without WITH (FORCE) which might not be supported in all versions
-                # First terminate all connections
-                log "Attempting to drop database forcefully"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "UPDATE pg_database SET datallowconn = 'false' WHERE datname = '$db_name';" || true
+                for schema in $schemas; do
+                    log "Dropping schema $schema owned by $user_name"
+                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "DROP SCHEMA IF EXISTS $schema CASCADE;"
+                done
                 
-                # Terminate existing connections
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
-                    SELECT pg_terminate_backend(pg_stat_activity.pid)
-                    FROM pg_stat_activity
-                    WHERE pg_stat_activity.datname = '$db_name'
-                    AND pid <> pg_backend_pid();" || true
+                # Try again to drop role
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" && {
+                    log "User $user_name dropped successfully after schema cleanup"
+                    break
+                }
+            fi
+            
+            # Try to reassign ownership and drop owned as a last resort
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "REASSIGN OWNED BY $user_name TO postgres; DROP OWNED BY $user_name CASCADE;" || true
+        done
+        
+        # Try once more to drop the role
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" || {
+            log "ERROR: Still could not drop user. Will continue with creating a new database."
+            # Force drop and recreate the database as last resort
+            log "Force dropping and recreating the demo database as last resort"
+            
+            # Generate a backup name for the database if we need to rename it
+            local timestamp=$(date +%Y%m%d%H%M%S)
+            local new_db_name="${db_name}_old_$timestamp"
+            
+            # Force drop database - without WITH (FORCE) which might not be supported in all versions
+            # First terminate all connections
+            log "Attempting to drop database forcefully"
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "UPDATE pg_database SET datallowconn = 'false' WHERE datname = '$db_name';" || true
+            
+            # Terminate existing connections
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
+                SELECT pg_terminate_backend(pg_stat_activity.pid)
+                FROM pg_stat_activity
+                WHERE pg_stat_activity.datname = '$db_name'
+                AND pid <> pg_backend_pid();" || true
+            
+            # Wait a moment for connections to be terminated
+            sleep 2
+            
+            # Now try to drop the database (should be no connections)
+            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE $db_name;" || {
+                log "WARNING: Could not drop database, trying to force connection termination again"
                 
-                # Wait a moment for connections to be terminated
-                sleep 2
-                
-                # Now try to drop the database (should be no connections)
+                # Wait longer and try again with more force
+                sleep 5
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';" || true
                 PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE $db_name;" || {
-                    log "WARNING: Could not drop database, trying to force connection termination again"
+                    # Final desperate measure - rename the database
+                    log "WARNING: Could not drop the database, renaming it instead"
                     
-                    # Wait longer and try again with more force
-                    sleep 5
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';" || true
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE $db_name;" || {
-                        # Final desperate measure - rename the database
-                        log "WARNING: Could not drop the database, renaming it instead"
-                        
-                        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true
-                    }
+                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true
                 }
             }
         }
-    fi
+    }
     
     # Create demo database (make sure it's owned by postgres initially)
     log "Creating demo database"
