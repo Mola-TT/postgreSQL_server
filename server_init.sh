@@ -1271,9 +1271,77 @@ EOF
     # 7. Add enhanced hostname validation for subdomain access control
     log "Setting up hostname validation for subdomain access control"
     
-    # Ensure we have the PostgreSQL configuration directory
-    local PG_VERSION=$(postgres -V | sed 's/^.* \([0-9]\+\.[0-9]\+\).*$/\1/')
-    local PG_CONF_DIR="/etc/postgresql/$PG_VERSION/main"
+    # Make sure version detection doesn't cause script failure
+    {
+        # Determine PostgreSQL version to use - avoid using the 'postgres' command directly
+        local use_pg_version=""
+        
+        # First try to use the PG_VERSION variable defined globally
+        if [ -n "$PG_VERSION" ]; then
+            use_pg_version="$PG_VERSION"
+            log "Using PostgreSQL version from environment: $use_pg_version"
+        # Next try to find version from psql
+        elif command_exists psql; then
+            use_pg_version=$(psql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)
+            if [ -n "$use_pg_version" ]; then
+                log "Detected PostgreSQL version from psql: $use_pg_version"
+            fi
+        # Next try to find from installed packages or directories
+        elif [ -d "/etc/postgresql" ]; then
+            # Get highest version from directory names
+            use_pg_version=$(find /etc/postgresql -mindepth 1 -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | sort -r | head -1 | grep -oE '[0-9]+' | head -1)
+            if [ -n "$use_pg_version" ]; then
+                log "Detected PostgreSQL version from directory: $use_pg_version"
+            fi
+        fi
+        
+        # If all detection methods fail, use default
+        if [ -z "$use_pg_version" ]; then
+            use_pg_version="17"  # Default to PostgreSQL 17
+            log "Using default PostgreSQL version: $use_pg_version"
+        fi
+    } || {
+        # If any of the above fails, use default version
+        log "ERROR: Failed to detect PostgreSQL version. Using default version 17."
+        local use_pg_version="17"
+    }
+    
+    # Create config directory path based on detected version
+    local PG_CONF_DIR="/etc/postgresql/$use_pg_version/main"
+    log "Using configuration directory path: $PG_CONF_DIR"
+    
+    # Add error handling to directory creation
+    {
+        # Ensure the configuration directory exists
+        if [ ! -d "$PG_CONF_DIR" ]; then
+            log "PostgreSQL configuration directory does not exist: $PG_CONF_DIR"
+            log "Creating directory: $PG_CONF_DIR"
+            
+            # Try to create with sudo first, then fall back to normal mkdir
+            { sudo mkdir -p "$PG_CONF_DIR" 2>/dev/null || mkdir -p "$PG_CONF_DIR" 2>/dev/null; } || {
+                log "WARNING: Failed to create PostgreSQL configuration directory"
+                
+                # Try fallback to /etc/dbhub if main directory creation fails
+                PG_CONF_DIR="/etc/dbhub"
+                log "Using fallback directory: $PG_CONF_DIR"
+                
+                { sudo mkdir -p "$PG_CONF_DIR" 2>/dev/null || mkdir -p "$PG_CONF_DIR" 2>/dev/null; } || {
+                    # If that fails too, fall back to /tmp
+                    log "WARNING: Failed to create fallback directory"
+                    PG_CONF_DIR="/tmp"
+                    log "Using /tmp as last resort"
+                }
+            }
+            
+            # Try to set appropriate permissions but don't fail if unsuccessful
+            sudo chown postgres:postgres "$PG_CONF_DIR" 2>/dev/null || true
+            sudo chmod 700 "$PG_CONF_DIR" 2>/dev/null || true
+        fi
+    } || {
+        # If any of the above fails completely, use /tmp as last resort
+        log "ERROR: Failed to set up configuration directory. Using /tmp as last resort."
+        PG_CONF_DIR="/tmp"
+    }
     
     # Create hostname map configuration
     local MAP_FILE="$PG_CONF_DIR/pg_hostname_map.conf"
@@ -1281,7 +1349,12 @@ EOF
     # Check if map file exists, create if not
     if [ ! -f "$MAP_FILE" ]; then
         log "Creating hostname map file: $MAP_FILE"
-        cat > "$MAP_FILE" << EOF
+        # Create file with error handling
+        {
+            # Ensure parent directory exists before writing to the file
+            mkdir -p "$(dirname "$MAP_FILE")" 2>/dev/null || true
+            if [ -d "$(dirname "$MAP_FILE")" ]; then
+                cat > "$MAP_FILE" << EOF || true
 # PostgreSQL Hostname Map Configuration
 # Format: <database_name> <allowed_hostname>
 # Example: mydatabase mydatabase.dbhub.cc
@@ -1289,8 +1362,19 @@ EOF
 # This file maps database names to allowed hostnames for connection validation
 
 EOF
-        chmod 640 "$MAP_FILE"
-        chown postgres:postgres "$MAP_FILE"
+                # Set permissions if file was created
+                if [ -f "$MAP_FILE" ]; then
+                    chmod 640 "$MAP_FILE" 2>/dev/null || true
+                    chown postgres:postgres "$MAP_FILE" 2>/dev/null || true
+                else
+                    log "WARNING: Could not create map file: $MAP_FILE"
+                fi
+            else
+                log "WARNING: Parent directory does not exist and could not be created: $(dirname "$MAP_FILE")"
+            fi
+        } || {
+            log "ERROR: Failed to create hostname map file. Continuing with script."
+        }
     fi
     
     # Add or update mapping for demo database
