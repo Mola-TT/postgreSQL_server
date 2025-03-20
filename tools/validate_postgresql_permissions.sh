@@ -336,51 +336,9 @@ test_demo_database() {
   log "INFO" "Demo database permission tests completed"
 }
 
-# Detect operating system
-detect_os() {
-  case "$(uname -s)" in
-    Linux*)     OS="Linux";;
-    Darwin*)    OS="Mac";;
-    CYGWIN*)    OS="Windows";;
-    MINGW*)     OS="Windows";;
-    MSYS*)      OS="Windows";;
-    *)          OS="Unknown";;
-  esac
-  
-  # Alternative detection for Windows using environment variables
-  if [ -z "$OS" ] || [ "$OS" = "Unknown" ]; then
-    if [ -n "$WINDIR" ] || [ -n "$windir" ] || [ -n "$SystemRoot" ]; then
-      OS="Windows"
-    fi
-  fi
-  
-  log "INFO" "Detected operating system: $OS"
-  
-  # Set psql command based on OS
-  if [ "$OS" = "Windows" ]; then
-    # For Windows, use the full path to psql if it's in a standard location
-    if [ -f "/c/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe" ]; then
-      PSQL_CMD="/c/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe"
-    elif [ -f "C:/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe" ]; then
-      PSQL_CMD="C:/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe"
-    else
-      # If not found, assume psql is in PATH
-      PSQL_CMD="psql"
-    fi
-  else
-    # For Linux/Mac, use standard psql command
-    PSQL_CMD="psql"
-  fi
-  
-  log "INFO" "Using psql command: $PSQL_CMD"
-}
-
 # Main execution function
 main() {
   log "INFO" "Starting PostgreSQL permission validation tests"
-  
-  # Detect operating system and set appropriate commands
-  detect_os
   
   # Auto-detect connection parameters
   auto_detect_connection
