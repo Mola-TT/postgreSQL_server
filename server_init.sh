@@ -924,7 +924,11 @@ EOF
                 
                 # Try one more DROP OWNED to be sure
                 log "Performing final DROP OWNED to clear any remaining dependencies"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $role_name CASCADE;" || true
+                if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$role_name'" 2>/dev/null)" = "1" ]; then
+                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $role_name CASCADE;" || true
+                else
+                    log "Role $role_name does not exist, skipping final DROP OWNED step"
+                fi
                 
                 # Now try to drop the role again
                 log "Attempting to drop role after dependencies have been cleared"
@@ -1022,7 +1026,12 @@ EOF
     
     # Drop owned by user in postgres database
     log "Dropping owned objects for $user_name in postgres database"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
+    # Check if role exists before trying to drop owned objects
+    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
+        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
+    else
+        log "Role $user_name does not exist, skipping DROP OWNED step"
+    fi
     
     # Try to drop the user directly first
     log "Attempting to drop user $user_name"
@@ -1054,7 +1063,11 @@ EOF
             fi
             
             # Try to reassign ownership and drop owned as a last resort
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "REASSIGN OWNED BY $user_name TO postgres; DROP OWNED BY $user_name CASCADE;" || true
+            if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
+                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "REASSIGN OWNED BY $user_name TO postgres; DROP OWNED BY $user_name CASCADE;" || true
+            else
+                log "Role $user_name does not exist in database $db, skipping reassign/drop owned steps"
+            fi
         done
         
         # Try once more to drop the role
