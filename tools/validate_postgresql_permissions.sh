@@ -13,14 +13,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Default connection parameters - will be auto-detected
-PG_HOST="localhost"
-PG_PORT="5432"
-PG_SUPERUSER="postgres"
-PG_PASSWORD="postgres"
-USE_PGBOUNCER=false
-PGBOUNCER_PORT="6432"
-
 # Logging function
 log() {
   local level=$1
@@ -42,6 +34,33 @@ log() {
   esac
 }
 
+# Load environment variables from .env file
+if [ -f "../.env" ]; then
+  # When running from tools/ directory
+  source "../.env"
+  ENV_LOADED=true
+  log "INFO" "Loaded environment variables from ../.env"
+elif [ -f ".env" ]; then
+  # When running from project root
+  source ".env"
+  ENV_LOADED=true
+  log "INFO" "Loaded environment variables from .env"
+else
+  ENV_LOADED=false
+  log "WARN" "No .env file found, using default values"
+fi
+
+# Default connection parameters - will be auto-detected or loaded from .env
+PG_HOST="localhost"
+PG_PORT="${PG_PORT:-5432}"
+PG_SUPERUSER="postgres"
+PG_PASSWORD="${PG_PASSWORD:-postgres}"
+USE_PGBOUNCER=false
+PGBOUNCER_PORT="${PGBOUNCER_PORT:-6432}"
+DEMO_DB_NAME="${DEMO_DB_NAME:-demo}"
+DEMO_DB_USER="${DEMO_DB_USER:-demo}"
+DEMO_DB_PASSWORD="${DEMO_DB_PASSWORD:-demo}"
+
 # Function to test PostgreSQL connection
 test_connection() {
   local host=$1
@@ -58,8 +77,30 @@ test_connection() {
 auto_detect_connection() {
   log "INFO" "Auto-detecting PostgreSQL connection parameters..."
   
+  # Try connecting with credentials from .env first
+  if [ "$ENV_LOADED" = true ]; then
+    log "INFO" "Trying connection with credentials from .env file"
+    
+    # Try PostgreSQL direct connection first
+    if test_connection "$PG_HOST" "$PG_PORT" "$PG_SUPERUSER" "$PG_PASSWORD" "postgres"; then
+      USE_PGBOUNCER=false
+      log "INFO" "✅ Successfully connected to PostgreSQL on port $PG_PORT with credentials from .env"
+      return 0
+    fi
+    
+    # Try PgBouncer connection
+    if test_connection "$PG_HOST" "$PGBOUNCER_PORT" "$PG_SUPERUSER" "$PG_PASSWORD" "postgres"; then
+      PG_PORT="$PGBOUNCER_PORT"
+      USE_PGBOUNCER=true
+      log "INFO" "✅ Successfully connected to PgBouncer on port $PGBOUNCER_PORT with credentials from .env"
+      return 0
+    fi
+    
+    log "WARN" "Could not connect with credentials from .env, trying fallback options"
+  fi
+  
   # Try different password options for postgres
-  for pw in "postgres" "$PG_PASSWORD"; do
+  for pw in "postgres" "$PG_PASSWORD" ""; do
     # First, try connecting to PostgreSQL directly
     if test_connection "$PG_HOST" "5432" "$PG_SUPERUSER" "$pw" "postgres"; then
       PG_PORT="5432"
@@ -69,7 +110,7 @@ auto_detect_connection() {
       return 0
     fi
     
-    # If direct connection failed, try PgBouncer
+    # Then try connecting through PgBouncer if available
     if test_connection "$PG_HOST" "6432" "$PG_SUPERUSER" "$pw" "postgres"; then
       PG_PORT="6432"
       PG_PASSWORD="$pw"
@@ -79,48 +120,43 @@ auto_detect_connection() {
     fi
   done
   
-  # Try to read password from environment variable if set
-  if [ -n "$PGPASSWORD" ]; then
-    if test_connection "$PG_HOST" "5432" "$PG_SUPERUSER" "$PGPASSWORD" "postgres"; then
-      PG_PORT="5432"
-      PG_PASSWORD="$PGPASSWORD"
-      USE_PGBOUNCER=false
-      log "INFO" "✅ Successfully connected to PostgreSQL on port 5432 using PGPASSWORD environment variable"
-      return 0
-    fi
-    
-    if test_connection "$PG_HOST" "6432" "$PG_SUPERUSER" "$PGPASSWORD" "postgres"; then
-      PG_PORT="6432"
-      PG_PASSWORD="$PGPASSWORD"
-      USE_PGBOUNCER=true
-      log "INFO" "✅ Successfully connected to PgBouncer on port 6432 using PGPASSWORD environment variable"
-      return 0
-    fi
-  fi
-  
-  # Try to read password from .pgpass file
-  if [ -f ~/.pgpass ]; then
-    log "INFO" "Found .pgpass file, attempting to use credentials"
-    
-    # Try PostgreSQL direct
-    if PGPASSWORD="" psql -h "$PG_HOST" -p "5432" -U "$PG_SUPERUSER" -d "postgres" -c "SELECT 1;" &>/dev/null; then
-      PG_PORT="5432"
-      USE_PGBOUNCER=false
-      log "INFO" "✅ Successfully connected to PostgreSQL on port 5432 using .pgpass credentials"
-      return 0
-    fi
-    
-    # Try PgBouncer
-    if PGPASSWORD="" psql -h "$PG_HOST" -p "6432" -U "$PG_SUPERUSER" -d "postgres" -c "SELECT 1;" &>/dev/null; then
-      PG_PORT="6432"
-      USE_PGBOUNCER=true
-      log "INFO" "✅ Successfully connected to PgBouncer on port 6432 using .pgpass credentials"
-      return 0
-    fi
-  fi
-  
-  # No connection methods worked
   log "ERROR" "❌ Could not connect to PostgreSQL or PgBouncer using any of the attempted methods"
+  log "ERROR" "Could not connect to PostgreSQL. Please check that the server is running."
+  log "ERROR" "If PostgreSQL is running, try setting PGPASSWORD environment variable."
+  log "ERROR" "Example: PGPASSWORD=mypassword ./validate_postgresql_permissions.sh"
+  
+  # Attempt to diagnose connection issues
+  log "INFO" "Running connection diagnostics..."
+  
+  # Check if PostgreSQL is running
+  if command -v systemctl &>/dev/null && systemctl is-active postgresql &>/dev/null; then
+    log "INFO" "PostgreSQL service is running"
+  else
+    log "WARN" "PostgreSQL service may not be running"
+  fi
+  
+  # Check if PgBouncer is running
+  if command -v systemctl &>/dev/null && systemctl is-active pgbouncer &>/dev/null; then
+    log "INFO" "PgBouncer service is running"
+  else
+    log "WARN" "PgBouncer service may not be running"
+  fi
+  
+  # Check if ports are open
+  if command -v nc &>/dev/null; then
+    if nc -z "$PG_HOST" 5432 &>/dev/null; then
+      log "INFO" "PostgreSQL port 5432 is open"
+    else
+      log "WARN" "PostgreSQL port 5432 is not accessible"
+    fi
+    
+    if nc -z "$PG_HOST" 6432 &>/dev/null; then
+      log "INFO" "PgBouncer port 6432 is open"
+    else
+      log "WARN" "PgBouncer port 6432 is not accessible"
+    fi
+  fi
+  
   return 1
 }
 
@@ -265,49 +301,117 @@ run_user_tests() {
   run_sql "$user" "$password" "postgres" "SELECT 1;" $is_admin "User $user connecting to postgres database"
 }
 
-# Main function
+# Test demo database permissions specifically
+test_demo_database() {
+  if [ -z "$DEMO_DB_NAME" ] || [ -z "$DEMO_DB_USER" ] || [ -z "$DEMO_DB_PASSWORD" ]; then
+    log "WARN" "Demo database credentials not fully defined in .env, skipping demo database tests"
+    return 1
+  }
+
+  log "INFO" "Testing demo database permissions..."
+  
+  # Test 1: Superuser connection to demo database
+  run_sql "$PG_SUPERUSER" "$PG_PASSWORD" "$DEMO_DB_NAME" "SELECT 1;" true "Superuser can connect to demo database"
+  
+  # Test 2: Demo user connection to own database
+  run_sql "$DEMO_DB_USER" "$DEMO_DB_PASSWORD" "$DEMO_DB_NAME" "SELECT 1;" true "Demo user can connect to its own database"
+  
+  # Test 3: Demo user can create tables in own database
+  run_sql "$DEMO_DB_USER" "$DEMO_DB_PASSWORD" "$DEMO_DB_NAME" "CREATE TABLE IF NOT EXISTS demo_test_table (id serial primary key, name text);" true "Demo user can create tables in demo database"
+  
+  # Test 4: Demo user cannot connect to postgres database
+  run_sql "$DEMO_DB_USER" "$DEMO_DB_PASSWORD" "postgres" "SELECT 1;" false "Demo user cannot connect to postgres database"
+  
+  # Test 5: Check proper isolation - create a test table in demo database
+  run_sql "$DEMO_DB_USER" "$DEMO_DB_PASSWORD" "$DEMO_DB_NAME" "INSERT INTO demo_test_table (name) VALUES ('test_value');" true "Demo user can insert data into demo database"
+  
+  # Test 6: Check if demo user can see list of databases (should be limited)
+  result=$(PGPASSWORD="$DEMO_DB_PASSWORD" psql -h "$PG_HOST" -p "$PG_PORT" -U "$DEMO_DB_USER" -d "$DEMO_DB_NAME" -t -c "SELECT datname FROM pg_database ORDER BY datname;" 2>/dev/null || echo "ERROR")
+  if echo "$result" | grep -q "postgres"; then
+    log "ERROR" "❌ TEST FAILED: Demo user can see postgres database, which violates isolation"
+  else
+    log "INFO" "✅ TEST PASSED: Demo user cannot see postgres database as expected"
+  fi
+  
+  log "INFO" "Demo database permission tests completed"
+}
+
+# Detect operating system
+detect_os() {
+  case "$(uname -s)" in
+    Linux*)     OS="Linux";;
+    Darwin*)    OS="Mac";;
+    CYGWIN*)    OS="Windows";;
+    MINGW*)     OS="Windows";;
+    MSYS*)      OS="Windows";;
+    *)          OS="Unknown";;
+  esac
+  
+  # Alternative detection for Windows using environment variables
+  if [ -z "$OS" ] || [ "$OS" = "Unknown" ]; then
+    if [ -n "$WINDIR" ] || [ -n "$windir" ] || [ -n "$SystemRoot" ]; then
+      OS="Windows"
+    fi
+  fi
+  
+  log "INFO" "Detected operating system: $OS"
+  
+  # Set psql command based on OS
+  if [ "$OS" = "Windows" ]; then
+    # For Windows, use the full path to psql if it's in a standard location
+    if [ -f "/c/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe" ]; then
+      PSQL_CMD="/c/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe"
+    elif [ -f "C:/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe" ]; then
+      PSQL_CMD="C:/Program Files/PostgreSQL/$PG_VERSION/bin/psql.exe"
+    else
+      # If not found, assume psql is in PATH
+      PSQL_CMD="psql"
+    fi
+  else
+    # For Linux/Mac, use standard psql command
+    PSQL_CMD="psql"
+  fi
+  
+  log "INFO" "Using psql command: $PSQL_CMD"
+}
+
+# Main execution function
 main() {
   log "INFO" "Starting PostgreSQL permission validation tests"
   
+  # Detect operating system and set appropriate commands
+  detect_os
+  
   # Auto-detect connection parameters
-  if ! auto_detect_connection; then
-    log "ERROR" "Could not connect to PostgreSQL. Please check that the server is running."
-    log "ERROR" "If PostgreSQL is running, try setting PGPASSWORD environment variable."
-    log "ERROR" "Example: PGPASSWORD=mypassword ./$(basename $0)"
+  auto_detect_connection
+  
+  if [ $? -ne 0 ]; then
     exit 1
   fi
   
-  log "INFO" "Using the following connection parameters:"
-  log "INFO" "  Host: $PG_HOST"
-  log "INFO" "  Port: $PG_PORT"
-  log "INFO" "  User: $PG_SUPERUSER"
+  log "INFO" "Using connection parameters: Host=$PG_HOST, Port=$PG_PORT, User=$PG_SUPERUSER"
   if [ "$USE_PGBOUNCER" = true ]; then
-    log "INFO" "  Connection via: PgBouncer"
+    log "INFO" "Connected through PgBouncer"
   else
-    log "INFO" "  Connection via: Direct PostgreSQL"
+    log "INFO" "Connected directly to PostgreSQL"
   fi
   
-  # Cleanup and setup
-  cleanup
-  setup
+  # Test demo database if .env was loaded
+  if [ "$ENV_LOADED" = true ]; then
+    test_demo_database
+  else
+    # Only set up test environment if not using existing demo
+    setup
+    
+    # Run tests for admin and regular users
+    run_user_tests "testadmin" "testadmin" true
+    run_user_tests "testuser" "testuser" false
+    
+    # Cleanup
+    cleanup
+  fi
   
-  # Run tests for both users
-  log "INFO" "===== Testing testadmin user (Should have admin rights) ====="
-  run_user_tests "testadmin" "testadmin" true
-  
-  log "INFO" "===== Testing testuser user (Should have limited rights) ====="
-  run_user_tests "testuser" "testuser" false
-  
-  # Summary
-  log "INFO" "===== Test Summary ====="
-  log "INFO" "✓ Test database created with testadmin as owner"
-  log "INFO" "✓ testuser created with limited permissions"
-  log "INFO" "✓ All permission tests completed"
-  
-  # Automatic cleanup to avoid manual input
-  log "INFO" "Cleaning up test environment"
-  cleanup
-  log "INFO" "Test environment cleaned up"
+  log "INFO" "All tests completed"
 }
 
 # Run the main function
