@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 
 # PostgreSQL Module
 # Contains functions for managing PostgreSQL databases and security configurations
@@ -1570,4 +1570,6 @@ EOF
     echo "$db_name,$user_name,$password"
     return 0
 }
+
+
 
