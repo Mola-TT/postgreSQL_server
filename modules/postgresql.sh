@@ -1184,7 +1184,7 @@ EOF
                     # Now try to drop the role again
                     log "Attempting to drop role after dependencies have been cleared"
                 }
-            }
+
             
             # Now try to drop the role
             sudo -u postgres psql -c "DROP ROLE IF EXISTS $role_name;"
@@ -1421,7 +1421,7 @@ EOF
             
             # Now try to drop the database (should be no connections)
             sudo -u postgres psql -c "DROP DATABASE $db_name;" || {
-                log "WARNING: Could not drop database, trying to force connection termination again"
+                log "WARNING: Could not drop the database, trying to force connection termination again"
                 
                 # Wait longer and try again with more force
                 sleep 5
