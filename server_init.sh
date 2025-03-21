@@ -1,6 +1,10 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 # Server Initialization Script
+# This script installs and configures PostgreSQL and PgBouncer
+# Note: When deploying to Linux, run 'chmod +x server_init.sh' to make it executable
+
+zation Script
 # This script installs and configures PostgreSQL and PgBouncer
 
 # SECURITY NOTICE: For sensitive information like passwords, use environment variables
