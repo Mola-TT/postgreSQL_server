@@ -1430,11 +1430,7 @@ EOF
                     # Final desperate measure - rename the database
                     log "WARNING: Could not drop the database, renaming it instead"
                     
-                    sudo -u postgres psql -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true
-                }
-            }
-        }
-    }
+                    sudo -u postgres psql -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true\n    }\n}\n    }\n}
     
     # Create demo database (make sure it's owned by postgres initially)
     log "Creating demo database"
