@@ -8,6 +8,11 @@ description:
 globs: 
 alwaysApply: true
 ---
+---
+description: 
+globs: 
+alwaysApply: true
+---
 Guidelines:
 1. **Development Environment**
    - The script is developed on a Windows machine.

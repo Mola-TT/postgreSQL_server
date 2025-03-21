@@ -8,6 +8,11 @@ description:
 globs: 
 alwaysApply: true
 ---
+---
+description: 
+globs: 
+alwaysApply: true
+---
 Guidelines:
 1. **Minimal Code** – No unnecessary functions, variables, or complexity.
 2. **Direct Implementation** – Solve the problem using the shortest and clearest approach.

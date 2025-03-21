@@ -8,6 +8,11 @@ description:
 globs: 
 alwaysApply: true
 ---
+---
+description: 
+globs: 
+alwaysApply: true
+---
 # Filename: postgresql_server_rules.mdc
 
 ## General PostgreSQL Server Behavior Rules
