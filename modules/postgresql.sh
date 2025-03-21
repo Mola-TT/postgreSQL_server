@@ -1569,4 +1569,5 @@ EOF
     # Return the user details for display in the summary
     echo "$db_name,$user_name,$password"
     return 0
-} 
+
+}
