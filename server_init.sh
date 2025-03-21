@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 
 # Server Initialization Script
 # This script installs and configures PostgreSQL and PgBouncer
@@ -190,14 +190,14 @@ wait_for_postgresql() {
     while [ $attempt -le $max_attempts ]; do
         if [ -n "$PG_PASSWORD" ]; then
             if PGPASSWORD="$PG_PASSWORD" pg_isready -h localhost -U postgres -q 2>/dev/null; then
-                log "PostgreSQL is ready"
-                return 0
+            log "PostgreSQL is ready"
+            return 0
             fi
         else
             # If PG_PASSWORD is not set, try without it
             if pg_isready -h localhost -q; then
-                log "PostgreSQL is ready"
-                return 0
+            log "PostgreSQL is ready"
+            return 0
             fi
         fi
         
@@ -477,17 +477,17 @@ EOF
         systemctl restart postgresql
         sleep 3
         log "PostgreSQL restarted with updated authentication configuration"
-        
-        # Grant postgres user access to pg_shadow for PgBouncer auth_query
-        log "Granting postgres user access to pg_shadow for PgBouncer SASL authentication"
+    
+    # Grant postgres user access to pg_shadow for PgBouncer auth_query
+    log "Granting postgres user access to pg_shadow for PgBouncer SASL authentication"
         if [ -n "$PG_PASSWORD" ]; then
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
         else
             log "WARNING: PG_PASSWORD not set, skipping access grant"
         fi
-        
-        # Revoke public schema privileges
-        log "Revoking public schema privileges"
+    
+    # Revoke public schema privileges
+    log "Revoking public schema privileges"
         if [ -n "$PG_PASSWORD" ]; then
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
             # Add additional security measure - prevent PUBLIC from accessing the postgres database
@@ -542,22 +542,22 @@ configure_pgbouncer() {
     fi
     
     # Check if SSL certificates exist
-    if [ ! -f "$SSL_DIR/server.crt" ] || [ ! -f "$SSL_DIR/server.key" ]; then
-        log "Generating self-signed SSL certificate for PgBouncer"
-        apt-get install -y openssl
-        
-        openssl req -new -x509 -days "${SSL_CERT_VALIDITY:-365}" -nodes \
-            -out "$SSL_DIR/server.crt" \
-            -keyout "$SSL_DIR/server.key" \
-            -subj "/C=${SSL_COUNTRY:-US}/ST=${SSL_STATE:-State}/L=${SSL_LOCALITY:-City}/O=${SSL_ORGANIZATION:-Organization}/CN=${SSL_COMMON_NAME:-localhost}"
-        
-        chmod 640 "$SSL_DIR/server.key"
-        chmod 644 "$SSL_DIR/server.crt"
-        chown postgres:postgres "$SSL_DIR/server.key" "$SSL_DIR/server.crt"
-        
-        log "Self-signed SSL certificate generated"
-    else
-        log "SSL certificates already exist"
+        if [ ! -f "$SSL_DIR/server.crt" ] || [ ! -f "$SSL_DIR/server.key" ]; then
+            log "Generating self-signed SSL certificate for PgBouncer"
+            apt-get install -y openssl
+            
+            openssl req -new -x509 -days "${SSL_CERT_VALIDITY:-365}" -nodes \
+                -out "$SSL_DIR/server.crt" \
+                -keyout "$SSL_DIR/server.key" \
+                -subj "/C=${SSL_COUNTRY:-US}/ST=${SSL_STATE:-State}/L=${SSL_LOCALITY:-City}/O=${SSL_ORGANIZATION:-Organization}/CN=${SSL_COMMON_NAME:-localhost}"
+            
+            chmod 640 "$SSL_DIR/server.key"
+            chmod 644 "$SSL_DIR/server.crt"
+            chown postgres:postgres "$SSL_DIR/server.key" "$SSL_DIR/server.crt"
+            
+            log "Self-signed SSL certificate generated"
+        else
+            log "SSL certificates already exist"
     fi
     
     # Configure PgBouncer to use plain text authentication for better compatibility
@@ -606,7 +606,7 @@ EOF
     if [ "${CREATE_DEMO_DB}" = "true" ] && [ -n "${DEMO_DB_USER}" ] && [ -n "${DEMO_DB_PASSWORD}" ]; then
         log "Adding demo user to PgBouncer userlist"
         echo "\"${DEMO_DB_USER}\" \"${DEMO_DB_PASSWORD}\"" >> "/etc/pgbouncer/userlist.txt"
-        log "Demo user added to PgBouncer userlist"
+            log "Demo user added to PgBouncer userlist"
     fi
     
     # Set permissions
@@ -636,11 +636,11 @@ EOF
         has_permission=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT has_table_privilege('postgres', 'pg_shadow', 'SELECT')" 2>/dev/null)
         
         if [ "$has_permission" != "t" ]; then
-            log "WARNING: postgres user does not have SELECT permission on pg_shadow."
-            log "Granting necessary permissions for auth_query"
+        log "WARNING: postgres user does not have SELECT permission on pg_shadow."
+        log "Granting necessary permissions for auth_query"
             PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER USER postgres WITH SUPERUSER;"
-        else
-            log "postgres user has proper permissions for auth_query"
+    else
+        log "postgres user has proper permissions for auth_query"
         fi
     else
         log "WARNING: PG_PASSWORD not set, skipping permissions verification"
@@ -706,8 +706,8 @@ EOF
                     
                     systemctl restart pgbouncer
                 fi
-            fi
-        else
+        fi
+    else
             # Try running PgBouncer directly with verbose output
             log "Running PgBouncer directly for debugging:"
             sudo -u postgres pgbouncer -v -d -u postgres /etc/pgbouncer/pgbouncer.ini || true
@@ -792,952 +792,11 @@ EOF
 
 # Function to create a demo database and user
 create_demo_database() {
-    log "Creating demo database and user"
-    
-    # Use environment variables if set, otherwise use defaults
-    local db_name="${DEMO_DB_NAME:-demo}"
-    local user_name="${DEMO_DB_USER:-demo}"
-    local password="${DEMO_DB_PASSWORD:-$(generate_password)}"
-    
-    # Check if demo database creation is enabled
-    if [ "$CREATE_DEMO_DB" != "true" ]; then
-        log "Demo database creation is disabled. Skipping."
-        return 0
-    fi
-    
-    log "Using demo database name: $db_name"
-    
-    # Derived settings
-    local role_name="${user_name}_role"
-    
-    # Check if user already exists - if so, drop it to ensure clean state
-    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
-        log "Demo user already exists, transferring database ownership and dropping user"
-        
-        # First change ownership of the database to postgres if it exists
-        if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
-            log "Changing ownership of $db_name database to postgres"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
-        fi
-        
-        # Revoke all privileges from the user on all databases
-        log "Revoking privileges for $user_name on all databases"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL PRIVILEGES ON DATABASE $db_name FROM $user_name;"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL PRIVILEGES ON DATABASE postgres FROM $user_name;"
-        
-        # Drop the database-specific role if it exists
-        if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$role_name'" 2>/dev/null)" = "1" ]; then
-            log "Dropping database-specific role: $role_name"
-            
-            # First handle dependencies by reassigning ownership of all objects owned by the role
-            if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
-                log "Checking for objects owned by $role_name in $db_name database"
-                
-                # Try with DROP OWNED BY first to reset dependency chain
-                log "Removing all objects owned by $role_name using DROP OWNED BY"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP OWNED BY $role_name CASCADE;" || true
-                
-                # Try to drop the role immediately after dropping owned objects
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;" && {
-                    log "Successfully dropped role $role_name after dropping owned objects"
-                    return 0
-                }
-                
-                # If drop still fails, try more aggressive approach with direct SQL 
-                log "Role still exists. Trying more aggressive approach to reassign ownership."
-                
-                # Reassign database ownership first if needed
-                if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name' AND datdba=(SELECT oid FROM pg_roles WHERE rolname='$role_name')" 2>/dev/null)" = "1" ]; then
-                    log "Reassigning database ownership from $role_name to postgres"
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
-                fi
-                
-                # Identify and fix any grants for the role that might be causing issues
-                log "Removing grants to/from the role"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $role_name;" || true
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $role_name;" || true
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM $role_name;" || true
-                
-                # Find dependent objects directly using detailed catalog queries
-                log "Finding and reassigning specific dependent objects"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
--- Create a temporary function to identify and fix object dependencies
-DO \$\$
-DECLARE
-    obj record;
-    dependent record;
-    cmd text;
-BEGIN
-    -- List members of the role and remove them
-    FOR obj IN SELECT rolname FROM pg_roles WHERE pg_has_role(rolname, '$role_name', 'MEMBER')
-    LOOP
-        EXECUTE 'REVOKE $role_name FROM ' || quote_ident(obj.rolname);
-        RAISE NOTICE 'Revoked membership from %', obj.rolname;
-    END LOOP;
-    
-    -- Reassign default privileges
-    FOR obj IN SELECT nspname, rolname FROM pg_namespace n, pg_roles r 
-              WHERE r.rolname = '$role_name'
-    LOOP
-        BEGIN
-            EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE ' || quote_ident('$role_name') || 
-                    ' IN SCHEMA ' || quote_ident(obj.nspname) || ' GRANT ALL ON TABLES TO postgres';
-            RAISE NOTICE 'Altered default privileges in schema %', obj.nspname;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE NOTICE 'Error altering default privileges: %', SQLERRM;
-        END;
-    END LOOP;
-    
-    -- Find and fix any foreign key constraints where the role is referenced
-    FOR obj IN SELECT conname, conrelid::regclass::text as tabname
-              FROM pg_constraint
-              WHERE contype = 'f' 
-              AND (conrelid::regclass::text IN 
-                   (SELECT tablename FROM pg_tables WHERE tableowner = '$role_name'))
-    LOOP
-        BEGIN
-            EXECUTE 'ALTER TABLE ' || obj.tabname || ' DROP CONSTRAINT ' || quote_ident(obj.conname);
-            RAISE NOTICE 'Dropped foreign key constraint % on table %', obj.conname, obj.tabname;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE NOTICE 'Error dropping constraint: %', SQLERRM;
-        END;
-    END LOOP;
-    
-    -- Reassign all objects of every type using pg_depend
-    FOR obj IN SELECT DISTINCT classid::regclass::text as objtype, objid::regclass::text as objname
-              FROM pg_depend d JOIN pg_authid a ON d.refobjid = a.oid
-              WHERE a.rolname = '$role_name'
-              AND classid::regclass::text NOT LIKE 'pg_%'
-    LOOP
-        BEGIN
-            IF obj.objtype = 'pg_class' THEN
-                EXECUTE 'ALTER TABLE ' || obj.objname || ' OWNER TO postgres';
-                RAISE NOTICE 'Changed ownership of % to postgres', obj.objname;
-            END IF;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE NOTICE 'Error changing ownership of %: %', obj.objname, SQLERRM;
-        END;
-    END LOOP;
-END
-\$\$;
-EOF
-                
-                # Try one more DROP OWNED to be sure
-                log "Performing final DROP OWNED to clear any remaining dependencies"
-                if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$role_name'" 2>/dev/null)" = "1" ]; then
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $role_name CASCADE;" || true
-                else
-                    log "Role $role_name does not exist, skipping final DROP OWNED step"
-                fi
-                
-                # Now try to drop the role again
-                log "Attempting to drop role after dependencies have been cleared"
-            fi
-            
-            # Now try to drop the role
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $role_name;"
-            
-            # If it still fails, try one final approach
-            if [ $? -ne 0 ]; then
-                log "Still unable to drop role due to dependencies. Using database-level approach..."
-                
-                # Try to force cascade drop at database level
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
-DO \$\$
-BEGIN
-    -- Try to revoke all privileges granted by the role
-    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM $role_name';
-    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM $role_name';
-    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM $role_name';
-    
-    -- Try to revoke all privileges granted to the role
-    EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE $db_name FROM $role_name';
-    EXECUTE 'REVOKE ALL PRIVILEGES ON SCHEMA public FROM $role_name';
-    
-    -- Final attempt to drop any owned objects
-    EXECUTE 'DROP OWNED BY $role_name CASCADE';
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Error during final cleanup: %', SQLERRM;
-END;
-\$\$;
-EOF
-                
-                # Ultra-aggressive dependency removal approach
-                log "Using aggressive dependency removal approach..."
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" << EOF
-DO \$\$
-DECLARE
-    obj record;
-    dep record;
-BEGIN
-    -- Identify and fix all objects that depend on the role
-    FOR obj IN 
-        SELECT DISTINCT 
-            cl.oid as objoid,
-            cl.relname as objname, 
-            n.nspname as schema
-        FROM pg_class cl
-        JOIN pg_namespace n ON cl.relnamespace = n.oid
-        JOIN pg_depend d ON d.objid = cl.oid
-        JOIN pg_authid a ON d.refobjid = a.oid
-        WHERE a.rolname = '$role_name'
-        AND n.nspname NOT LIKE 'pg_%'
-    LOOP
-        -- For each object, change its owner to postgres
-        BEGIN
-            EXECUTE format('ALTER %s %I.%I OWNER TO postgres', 
-                          CASE 
-                            WHEN EXISTS (SELECT 1 FROM pg_tables WHERE schemaname=obj.schema AND tablename=obj.objname) THEN 'TABLE'
-                            WHEN EXISTS (SELECT 1 FROM pg_views WHERE schemaname=obj.schema AND viewname=obj.objname) THEN 'VIEW'
-                            WHEN EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace=n.oid 
-                                        WHERE n.nspname=obj.schema AND t.typname=obj.objname) THEN 'TYPE'
-                            ELSE 'TABLE'
-                          END,
-                          obj.schema, obj.objname);
-            RAISE NOTICE 'Changed owner of %.% to postgres', obj.schema, obj.objname;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE NOTICE 'Could not change owner of %.%: %', obj.schema, obj.objname, SQLERRM;
-        END;
-    END LOOP;
-    
-    -- Try to clean up functions owned by the role
-    FOR obj IN 
-        SELECT p.oid, p.proname, n.nspname as schema
-        FROM pg_proc p
-        JOIN pg_namespace n ON p.pronamespace = n.oid
-        WHERE p.proowner = (SELECT oid FROM pg_authid WHERE rolname = '$role_name')
-        AND n.nspname NOT LIKE 'pg_%'
-    LOOP
-        BEGIN
-            EXECUTE format('ALTER FUNCTION %I.%I() OWNER TO postgres', obj.schema, obj.proname);
-            RAISE NOTICE 'Changed owner of function %.% to postgres', obj.schema, obj.proname;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE NOTICE 'Could not change owner of function %.%: %', obj.schema, obj.proname, SQLERRM;
-        END;
-    END LOOP;
-    
-    -- Try to clean up acess privileges referencing this role
-    EXECUTE 'UPDATE pg_class SET relacl = NULL WHERE relacl::text LIKE ''%' || '$role_name' || '%''';
-    EXECUTE 'UPDATE pg_proc SET proacl = NULL WHERE proacl::text LIKE ''%' || '$role_name' || '%''';
-    EXECUTE 'UPDATE pg_namespace SET nspacl = NULL WHERE nspacl::text LIKE ''%' || '$role_name' || '%''';
-    EXECUTE 'UPDATE pg_type SET typacl = NULL WHERE typacl::text LIKE ''%' || '$role_name' || '%''';
-    
-    -- Final DROP OWNED attempt
-    BEGIN
-        EXECUTE 'DROP OWNED BY $role_name CASCADE';
-    EXCEPTION WHEN OTHERS THEN
-        RAISE NOTICE 'Final DROP OWNED failed: %', SQLERRM;
-    END;
-END \$\$;" "$db_name"
-
-                # Try dropping the role one final time
-                run_psql_silent "DROP ROLE IF EXISTS $role_name;"
-
-                # If it still fails, warn but continue with script
-                if [ $? -ne 0 ]; then
-                    log "WARNING: Unable to drop role $role_name despite multiple attempts. This may leave orphaned objects."
-                    log "WARNING: Proceeding with the rest of the script. Manual cleanup may be needed later."
-                else
-                    log "Successfully dropped role $role_name after extensive cleanup"
-                fi
-            fi
-        fi
-    fi
-    
-    # Check if role owns any objects in the demo database and reassign them to postgres
-    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" = "1" ]; then
-        log "Reassigning owned objects in $db_name database to postgres"
-        run_psql_silent "REASSIGN OWNED BY $user_name TO postgres;"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;"
-        
-        log "Performing additional object cleanup in $db_name database"
-        
-        # Find remaining objects owned by the user in the demo database
-        local objects_sql="SELECT nspname, relname, relkind FROM pg_class c
-                         JOIN pg_namespace n ON c.relnamespace = n.oid
-                         WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
-                         ORDER BY relkind, nspname, relname;"
-        
-        # Try to drop these objects - using -t (tuples only) and -A (unaligned) for clean output
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$objects_sql" | while read schema table kind; do
-            [ -z "$schema" ] && continue
-            
-            if [ "$kind" = "r" ]; then # regular table
-                log "Dropping table $schema.$table owned by $user_name"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP TABLE IF EXISTS $schema.$table CASCADE;"
-            elif [ "$kind" = "v" ]; then # view
-                log "Dropping view $schema.$table owned by $user_name"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP VIEW IF EXISTS $schema.$table CASCADE;"
-            elif [ "$kind" = "S" ]; then # sequence
-                log "Dropping sequence $schema.$table owned by $user_name"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP SEQUENCE IF EXISTS $schema.$table CASCADE;"
-            elif [ "$kind" = "i" ]; then # index
-                log "Dropping index $schema.$table owned by $user_name"
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP INDEX IF EXISTS $schema.$table CASCADE;"
-            fi
-        done
-        
-        # Check for functions owned by the user
-        local functions_sql="SELECT nspname, proname FROM pg_proc p
-                          JOIN pg_namespace n ON p.pronamespace = n.oid
-                          WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
-                          ORDER BY nspname, proname;"
-        
-        # Try to drop these functions - using -t (tuples only) and -A (unaligned) for clean output
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -t -A -F' ' -c "$functions_sql" | while read schema func; do
-            [ -z "$schema" ] && continue
-            
-            log "Dropping function $schema.$func owned by $user_name"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "DROP FUNCTION IF EXISTS $schema.$func CASCADE;"
-        done
-    fi
-    
-    # Drop owned by user in postgres database
-    log "Dropping owned objects for $user_name in postgres database"
-    # Check if role exists before trying to drop owned objects
-    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP OWNED BY $user_name CASCADE;"
-    else
-        log "Role $user_name does not exist, skipping DROP OWNED step"
-    fi
-    
-    # Try to drop the user directly first
-    log "Attempting to drop user $user_name"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" && {
-        log "User $user_name dropped successfully"
-    } || {
-        # Find and drop remaining dependencies in all databases
-        log "Scanning all databases for remaining dependencies"
-        for db in $(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0', 'template1') AND datistemplate = false;"); do
-            log "Checking database: $db"
-            
-            # If this is the demo database, try drastic measures - drop schemas owned by the user
-            if [ "$db" = "$db_name" ]; then
-                log "Taking drastic measures in demo database"
-                
-                # Try to drop schemas
-                local schemas=$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -tAc "SELECT nspname FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name');")
-                
-                for schema in $schemas; do
-                    log "Dropping schema $schema owned by $user_name"
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "DROP SCHEMA IF EXISTS $schema CASCADE;"
-                done
-                
-                # Try again to drop role
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" && {
-                    log "User $user_name dropped successfully after schema cleanup"
-                    break
-                }
-            fi
-            
-            # Try to reassign ownership and drop owned as a last resort
-            if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null)" = "1" ]; then
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db" -c "REASSIGN OWNED BY $user_name TO postgres; DROP OWNED BY $user_name CASCADE;" || true
-            else
-                log "Role $user_name does not exist in database $db, skipping reassign/drop owned steps"
-            fi
-        done
-        
-        # Try once more to drop the role
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP ROLE IF EXISTS $user_name;" || {
-            log "ERROR: Still could not drop user. Will continue with creating a new database."
-            # Force drop and recreate the database as last resort
-            log "Force dropping and recreating the demo database as last resort"
-            
-            # Generate a backup name for the database if we need to rename it
-            local timestamp=$(date +%Y%m%d%H%M%S)
-            local new_db_name="${db_name}_old_$timestamp"
-            
-            # Force drop database - without WITH (FORCE) which might not be supported in all versions
-            # First terminate all connections
-            log "Attempting to drop database forcefully"
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "UPDATE pg_database SET datallowconn = 'false' WHERE datname = '$db_name';" || true
-            
-            # Terminate existing connections
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
-                SELECT pg_terminate_backend(pg_stat_activity.pid)
-                FROM pg_stat_activity
-                WHERE pg_stat_activity.datname = '$db_name'
-                AND pid <> pg_backend_pid();" || true
-            
-            # Wait a moment for connections to be terminated
-            sleep 2
-            
-            # Now try to drop the database (should be no connections)
-            PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE $db_name;" || {
-                log "WARNING: Could not drop database, trying to force connection termination again"
-                
-                # Wait longer and try again with more force
-                sleep 5
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';" || true
-                PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "DROP DATABASE $db_name;" || {
-                    # Final desperate measure - rename the database
-                    log "WARNING: Could not drop the database, renaming it instead"
-                    
-                    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true
-                }
-            }
-        }
-    }
-    
-    # Create demo database (make sure it's owned by postgres initially)
-    log "Creating demo database"
-    if [ "$(PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null)" != "1" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE DATABASE $db_name OWNER postgres;"
-        log "Demo database created"
-    else
-        log "Demo database already exists, ensuring correct ownership"
-        PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "ALTER DATABASE $db_name OWNER TO postgres;"
-    fi
-    
-    # Create the demo user
-    log "Creating demo user"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE ROLE $user_name WITH LOGIN PASSWORD '$password';"
-    
-    # Create a database-specific role for stricter isolation
-    log "Creating database-specific role"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "CREATE ROLE $role_name;"
-    
-    # Start implementing multi-layered isolation measures
-    
-    # 1. Set up proper privileges and schema security
-    log "Setting up schema security and privileges"
-    
-    # Connect to the demo database and set up its schema security
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "
-        -- Revoke public schema usage from PUBLIC and grant it only to specific users
-        REVOKE ALL ON SCHEMA public FROM PUBLIC;
-        GRANT ALL ON SCHEMA public TO postgres;
-        GRANT ALL ON SCHEMA public TO $role_name;
-        GRANT USAGE ON SCHEMA public TO $user_name;
-        
-        -- Grant privileges on all existing tables
-        GRANT ALL ON ALL TABLES IN SCHEMA public TO $role_name;
-        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO $user_name;
-        
-        -- Grant privileges on all future tables
-        ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
-            GRANT ALL ON TABLES TO $role_name;
-        ALTER DEFAULT PRIVILEGES FOR ROLE $role_name IN SCHEMA public
-            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO $user_name;
-            
-        -- Grant privileges on all sequences
-        GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $role_name;
-        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO $user_name;
-        
-        -- Grant privileges on all future sequences
-        ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
-            GRANT ALL ON SEQUENCES TO $role_name;
-        ALTER DEFAULT PRIVILEGES FOR ROLE $role_name IN SCHEMA public
-            GRANT USAGE, SELECT ON SEQUENCES TO $user_name;
-    "
-    
-    # 2. Explicitly revoke connect permission to postgres database
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON DATABASE postgres FROM PUBLIC;"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE ALL ON DATABASE postgres FROM $user_name;"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE CONNECT ON DATABASE postgres FROM $user_name;"
-    
-    # 3. Grant specific privileges only to the demo database
-    log "Setting up proper schema permissions in the demo database"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
-        -- Grant connect to the demo database
-        GRANT CONNECT ON DATABASE $db_name TO $user_name;
-        
-        -- Set the user's search_path to be restricted
-        ALTER ROLE $user_name SET search_path TO $db_name, public;
-    "
-    
-    # 4a. Block visibility of other databases through catalog views
-    log "Restricting visibility of other databases"
-    
-    # Revoke access to system catalog views that expose database information
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "REVOKE SELECT ON pg_catalog.pg_database FROM $user_name;"
-    
-    # 4b. Create a database-specific view of pg_database that only shows the demo database
-    
-    # Create a database-specific role to strictly limit visibility
-    log "Creating database-specific role for strict isolation"
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -c "
-        -- Grant membership in the role to the user
-        GRANT $role_name TO $user_name;
-        
-        -- Transfer ownership of the database to the role
-        ALTER DATABASE $db_name OWNER TO ${user_name}_role;
-    "
-    
-    # Create a function that fakes the pg_database view
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "CREATE OR REPLACE FUNCTION public.database_list() RETURNS SETOF pg_catalog.pg_database AS \$\$
-        SELECT * FROM pg_catalog.pg_database WHERE datname = '$db_name';
-    \$\$ LANGUAGE sql SECURITY DEFINER;"
-    
-    # Create a restricted view that only shows the demo database
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "CREATE OR REPLACE VIEW pg_database_filtered AS
-        SELECT * FROM pg_catalog.pg_database WHERE datname = '$db_name';"
-    
-    # Grant permissions on the function and view
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "
-        -- Grant select on the filtered view
-        GRANT SELECT ON pg_database_filtered TO $user_name;
-    "
-    
-    # Create additional restrictions at PostgreSQL server level to hide databases
-    log "Configuring additional database visibility restrictions"
-    
-    # Create a visibility restriction function for the user
-    
-    # Set ownership of the function to postgres (to prevent the user from modifying it)
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "ALTER FUNCTION public.database_list() OWNER TO postgres;"
-    
-    # Grant execute to the user
-    PGPASSWORD="$PG_PASSWORD" psql -h localhost -U postgres -d "$db_name" -c "GRANT EXECUTE ON FUNCTION public.database_list() TO $user_name;"
-    
-    # 5. Add database-specific access rules to pg_hba.conf
-    log "Setting up database-specific access controls in pg_hba.conf"
-    
-    # Check if database-specific rules already exist
-    if ! grep -q "^host ${db_name} ${user_name}" "$PG_HBA_CONF"; then
-        # Backup pg_hba.conf before modifying it
-        backup_file "$PG_HBA_CONF"
-        
-        log "Adding database-specific rules to pg_hba.conf"
-        
-        # Prepare a temporary file
-        local TEMP_HBA="/tmp/pg_hba.conf.$$"
-        cp "$PG_HBA_CONF" "$TEMP_HBA"
-        
-        # Add rules to explicitly allow demo user to connect only to demo database
-        # and explicitly deny access to postgres database
-        cat >> "$TEMP_HBA" << EOF
-
-# Database-specific access control for DBHub.cc demo database
-host    $db_name        $user_name        127.0.0.1/32            scram-sha-256
-host    $db_name        $user_name        ::1/128                 scram-sha-256
-host    postgres        $user_name        all                     reject
-EOF
-        
-        # Move the updated file back in place
-        cat "$TEMP_HBA" > "$PG_HBA_CONF"
-        rm -f "$TEMP_HBA"
-    else
-        log "Database-specific rules already exist in pg_hba.conf"
-    fi
-    
-    # 6. Modify connection parameters for PgBouncer to force maintenance database
-    if [ -f /etc/pgbouncer/pgbouncer.ini ]; then
-        log "Configuring PgBouncer for the demo database"
-        
-        # Remove existing demo database entry if exists
-        sed -i "/^$db_name = /d" /etc/pgbouncer/pgbouncer.ini
-        
-        # Add specific entry for demo database WITHOUT maintenance_db parameter (it's not supported by PgBouncer)
-        sed -i "/\[databases\]/a $db_name = host=localhost port=5432 dbname=$db_name user=$user_name password=$password" /etc/pgbouncer/pgbouncer.ini
-        
-        # Reload PgBouncer
-        systemctl reload pgbouncer
-    fi
-    
-    # 7. Add enhanced hostname validation for subdomain access control
-    log "Setting up hostname validation for subdomain access control"
-    
-    # Make sure version detection doesn't cause script failure
-    {
-        # Determine PostgreSQL version to use - avoid using the 'postgres' command directly
-        local use_pg_version=""
-        
-        # First try to use the PG_VERSION variable defined globally
-        if [ -n "$PG_VERSION" ]; then
-            use_pg_version="$PG_VERSION"
-            log "Using PostgreSQL version from environment: $use_pg_version"
-        # Next try to find version from psql
-        elif command_exists psql; then
-            use_pg_version=$(psql --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)
-            if [ -n "$use_pg_version" ]; then
-                log "Detected PostgreSQL version from psql: $use_pg_version"
-            fi
-        # Next try to find from installed packages or directories
-        elif [ -d "/etc/postgresql" ]; then
-            # Get highest version from directory names
-            use_pg_version=$(find /etc/postgresql -mindepth 1 -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | sort -r | head -1 | grep -oE '[0-9]+' | head -1)
-            if [ -n "$use_pg_version" ]; then
-                log "Detected PostgreSQL version from directory: $use_pg_version"
-            fi
-        fi
-        
-        # If all detection methods fail, use default
-        if [ -z "$use_pg_version" ]; then
-            use_pg_version="17"  # Default to PostgreSQL 17
-            log "Using default PostgreSQL version: $use_pg_version"
-        fi
-    } || {
-        # If any of the above fails, use default version
-        log "ERROR: Failed to detect PostgreSQL version. Using default version 17."
-        local use_pg_version="17"
-    }
-    
-    # Create config directory path based on detected version
-    local PG_CONF_DIR="/etc/postgresql/$use_pg_version/main"
-    log "Using configuration directory path: $PG_CONF_DIR"
-    
-    # Add error handling to directory creation
-    {
-        # Ensure the configuration directory exists
-        if [ ! -d "$PG_CONF_DIR" ]; then
-            log "PostgreSQL configuration directory does not exist: $PG_CONF_DIR"
-            log "Creating directory: $PG_CONF_DIR"
-            
-            # Try to create with sudo first, then fall back to normal mkdir
-            { sudo mkdir -p "$PG_CONF_DIR" 2>/dev/null || mkdir -p "$PG_CONF_DIR" 2>/dev/null; } || {
-                log "WARNING: Failed to create PostgreSQL configuration directory"
-                
-                # Try fallback to /etc/dbhub if main directory creation fails
-                PG_CONF_DIR="/etc/dbhub"
-                log "Using fallback directory: $PG_CONF_DIR"
-                
-                { sudo mkdir -p "$PG_CONF_DIR" 2>/dev/null || mkdir -p "$PG_CONF_DIR" 2>/dev/null; } || {
-                    # If that fails too, fall back to /tmp
-                    log "WARNING: Failed to create fallback directory"
-                    PG_CONF_DIR="/tmp"
-                    log "Using /tmp as last resort"
-                }
-            }
-            
-            # Try to set appropriate permissions but don't fail if unsuccessful
-            sudo chown postgres:postgres "$PG_CONF_DIR" 2>/dev/null || true
-            sudo chmod 700 "$PG_CONF_DIR" 2>/dev/null || true
-        fi
-    } || {
-        # If any of the above fails completely, use /tmp as last resort
-        log "ERROR: Failed to set up configuration directory. Using /tmp as last resort."
-        PG_CONF_DIR="/tmp"
-    }
-    
-    # Create hostname map configuration
-    local MAP_FILE="$PG_CONF_DIR/pg_hostname_map.conf"
-    
-    # Check if map file exists, create if not
-    if [ ! -f "$MAP_FILE" ]; then
-        log "Creating hostname map file: $MAP_FILE"
-        # Create file with error handling
-        {
-            # Ensure parent directory exists before writing to the file
-            mkdir -p "$(dirname "$MAP_FILE")" 2>/dev/null || true
-            if [ -d "$(dirname "$MAP_FILE")" ]; then
-                cat > "$MAP_FILE" << EOF || true
-# PostgreSQL Hostname Map Configuration
-# Format: <database_name> <allowed_hostname>
-# Example: mydatabase mydatabase.dbhub.cc
-#
-# This file maps database names to allowed hostnames for connection validation
-
-EOF
-                # Set permissions if file was created
-                if [ -f "$MAP_FILE" ]; then
-                    chmod 640 "$MAP_FILE" 2>/dev/null || true
-                    chown postgres:postgres "$MAP_FILE" 2>/dev/null || true
-                else
-                    log "WARNING: Could not create map file: $MAP_FILE"
-                fi
-            else
-                log "WARNING: Parent directory does not exist and could not be created: $(dirname "$MAP_FILE")"
-            fi
-        } || {
-            log "ERROR: Failed to create hostname map file. Continuing with script."
-        }
-    fi
-    
-    # Add or update mapping for demo database
-    local DOMAIN_SUFFIX="${DOMAIN_SUFFIX:-dbhub.cc}"
-    local SUBDOMAIN="${DEMO_SUBDOMAIN:-$db_name}"
-    
-    # Check if mapping already exists
-    if grep -q "^$db_name " "$MAP_FILE"; then
-        # Update existing mapping
-        log "Updating existing mapping for '$db_name'"
-        sed -i "s|^$db_name .*|$db_name $SUBDOMAIN.$DOMAIN_SUFFIX|" "$MAP_FILE"
-    else
-        # Add new mapping
-        log "Adding new mapping for '$db_name'"
-        echo "$db_name $SUBDOMAIN.$DOMAIN_SUFFIX" >> "$MAP_FILE"
-    fi
-    
-    # Apply hostname validation function
-    log "Creating hostname validation function for '$db_name'"
-    
-    # Use our new hostname validation function
-    create_hostname_validation_function "$db_name" "$SUBDOMAIN" "$DOMAIN_SUFFIX"
-    
-    # Configure pg_hba.conf for hostname-based access
-    enforce_hostname_based_access "$db_name" "$SUBDOMAIN.$DOMAIN_SUFFIX"
-    
-    # Reload PostgreSQL for changes to take effect
-    log "Reloading PostgreSQL configuration"
-    systemctl reload postgresql
-    
-    log "Demo database and user created with strict isolation"
-    log "Demo user can ONLY access the $db_name database"
-    log "The database is ONLY accessible through subdomain $SUBDOMAIN.$DOMAIN_SUFFIX"
-    
-    # Wait a moment for changes to take effect
-    sleep 3
-    
-    # Test the subdomain access restrictions
-    log "Testing subdomain access restrictions"
-    
-    # Test with correct subdomain
-    log "Testing access with correct subdomain ($SUBDOMAIN.$DOMAIN_SUFFIX)"
-    PGAPPNAME="$SUBDOMAIN.$DOMAIN_SUFFIX" PGPASSWORD="$password" psql -h localhost -U "$user_name" -d "$db_name" -c "SELECT current_database()" >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        log "SUCCESS: Connection through correct subdomain works"
-    else
-        log "WARNING: Connection through correct subdomain failed"
-    fi
-    
-    # Test with incorrect subdomain
-    log "Testing access with incorrect subdomain (dbhub.cc)"
-    PGAPPNAME="dbhub.cc" PGPASSWORD="$password" psql -h localhost -U "$user_name" -d "$db_name" -c "SELECT current_database()" >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        log "SUCCESS: Connection through incorrect hostname is properly blocked"
-    else
-        log "WARNING: Connection through incorrect hostname was NOT blocked"
-        log "Subdomain access control may not be working correctly"
-    fi
-    
-    # Store user info and credentials
-    save_database_credentials "$db_name" "$user_name" "$password"
-    
-    # Return the user details for display in the summary
-    echo "$db_name,$user_name,$password"
-}
-
-# Function to save database credentials to a file for reference
-save_database_credentials() {
-    local db_name="$1"
-    local user_name="$2"
-    local password="$3"
-    local credentials_dir="/opt/dbhub/credentials"
-    local credentials_file="$credentials_dir/${db_name}_credentials.txt"
-    
-    # Create credentials directory if it doesn't exist
-    mkdir -p "$credentials_dir" 2>/dev/null || {
-        log "WARNING: Could not create credentials directory. Saving to /tmp instead."
-        credentials_dir="/tmp"
-        credentials_file="$credentials_dir/${db_name}_credentials.txt"
-    }
-    
-    # Secure the directory
-    chmod 700 "$credentials_dir" 2>/dev/null || true
-    
-    # Save credentials to file
-    cat > "$credentials_file" << EOF
-# Database Credentials for $db_name
-# Generated on $(date)
-# 
-# IMPORTANT: Keep this information secure!
-
-DATABASE_NAME=$db_name
-USERNAME=$user_name
-PASSWORD=$password
-HOST=localhost
-POSTGRES_PORT=5432
-PGBOUNCER_PORT=6432
-ALLOWED_HOSTNAME=$db_name.${DOMAIN_SUFFIX:-dbhub.cc}
-
-# Connection string examples:
-# Direct PostgreSQL: postgresql://$user_name:$password@localhost:5432/$db_name
-# Via PgBouncer:    postgresql://$user_name:$password@localhost:6432/$db_name
-# 
-# Command line connection:
-# PGPASSWORD=$password psql -h localhost -p 5432 -U $user_name -d $db_name
-EOF
-    
-    # Secure the file
-    chmod 600 "$credentials_file" 2>/dev/null || true
-    
-    log "Saved database credentials to $credentials_file"
-}
-
-# Function to set up monitoring scripts
-setup_monitoring() {
-    log "Setting up monitoring scripts"
-    
-    # Create scripts directory
-    mkdir -p /opt/dbhub/scripts
-    
-    # Create log directory for scripts
-    mkdir -p /var/log/dbhub
-    chown postgres:postgres /var/log/dbhub
-    
-    # Copy monitoring scripts
-    cp scripts/server_monitor.sh /opt/dbhub/scripts/
-    cp scripts/backup_postgres.sh /opt/dbhub/scripts/
-    cp scripts/restore_postgres.sh /opt/dbhub/scripts/
-    cp scripts/db_user_manager.sh /opt/dbhub/scripts/
-    cp scripts/update_pgbouncer_users.sh /opt/dbhub/scripts/
-    
-    # Set permissions
-    chmod +x /opt/dbhub/scripts/*.sh
-    chown postgres:postgres /opt/dbhub/scripts/*.sh
-    
-    # Create symbolic links for commonly used scripts
-    ln -sf /opt/dbhub/scripts/db_user_manager.sh /usr/local/bin/db-user
-    ln -sf /opt/dbhub/scripts/update_pgbouncer_users.sh /usr/local/bin/pgbouncer-users
-    
-    # Set up cron jobs
-    log "Setting up cron jobs"
-    
-    # Add server monitoring cron job (every 15 minutes)
-    (crontab -l 2>/dev/null || echo "") | grep -v "server_monitor.sh" | { cat; echo "*/15 * * * * /opt/dbhub/scripts/server_monitor.sh > /dev/null 2>&1"; } | crontab -
-    
-    # Add backup cron job (daily at 2 AM)
-    (crontab -l 2>/dev/null || echo "") | grep -v "backup_postgres.sh" | { cat; echo "0 2 * * * /opt/dbhub/scripts/backup_postgres.sh > /dev/null 2>&1"; } | crontab -
-    
-    # Add PgBouncer user update cron job (daily at 3 AM)
-    (crontab -l 2>/dev/null || echo "") | grep -v "update_pgbouncer_users.sh" | { cat; echo "0 3 * * * /opt/dbhub/scripts/update_pgbouncer_users.sh > /dev/null 2>&1"; } | crontab -
-    
-    log "Monitoring setup completed"
-}
-
-# Function to run diagnostics
-run_diagnostics() {
-    log "Running PostgreSQL diagnostics"
-    
-    # Check if PostgreSQL is installed
-    if command_exists psql; then
-        log "PostgreSQL client is installed: $(psql --version)"
-    else
-        log "ERROR: PostgreSQL client is not installed"
-    fi
-    
-    # Check PostgreSQL service status
-    log "PostgreSQL service status:"
-    systemctl status postgresql || log "Failed to get PostgreSQL service status"
-    
-    # Check PostgreSQL cluster status
-    log "PostgreSQL cluster status:"
-    pg_lsclusters || log "Failed to list PostgreSQL clusters"
-    
-    # Check PostgreSQL data directory
-    log "PostgreSQL data directory:"
-    ls -la /var/lib/postgresql/$PG_VERSION/main/ || log "Failed to list PostgreSQL data directory"
-    
-    # Check PostgreSQL configuration directory
-    log "PostgreSQL configuration directory:"
-    ls -la /etc/postgresql/$PG_VERSION/main/ || log "Failed to list PostgreSQL configuration directory"
-    
-    # Check PostgreSQL log directory
-    log "PostgreSQL log directory:"
-    ls -la /var/log/postgresql/ || log "Failed to list PostgreSQL log directory"
-    
-    # Check if PostgreSQL port is in use
-    log "Checking if PostgreSQL port is in use:"
-    lsof -i :5432 || log "No process found using port 5432 with lsof"
-    
-    # Check if PostgreSQL is accepting connections
-    log "Checking if PostgreSQL is accepting connections:"
-    sudo -u postgres pg_isready || log "PostgreSQL is not accepting connections"
-    
-    # Check PostgreSQL logs for errors
-    check_postgresql_logs
-    
-    # If PostgreSQL is not running, try to fix it
-    if ! pg_isready -h localhost -q; then
-        log "PostgreSQL is not running properly. Attempting to fix..."
-        fix_postgresql_cluster
-        
-        # Check again after fix attempt
-        if ! pg_isready -h localhost -q; then
-            log "ERROR: PostgreSQL is still not running properly after fix attempts"
-            log "Please check the logs and run the diagnostics command for more information"
-            exit 1
-        fi
-    fi
-}
-
-# Function to fix PostgreSQL cluster issues
-fix_postgresql_cluster() {
-    log "Fixing PostgreSQL cluster issues"
-    
-    # Check if cluster exists but is down
-    if pg_lsclusters | grep -q "down"; then
-        log "PostgreSQL cluster exists but is down. Attempting to start it..."
-        
-        # Try to start the cluster
-        if pg_ctlcluster $PG_VERSION main start; then
-            log "Successfully started PostgreSQL cluster"
-            return 0
-        else
-            log "Failed to start PostgreSQL cluster with pg_ctlcluster. Trying alternative methods..."
-        fi
-    fi
-    
-    # Check if data directory is initialized
-    if [ -f "/var/lib/postgresql/$PG_VERSION/main/PG_VERSION" ]; then
-        log "PostgreSQL data directory is initialized but cluster won't start. Checking permissions..."
-        
-        # Fix permissions
-        chown -R postgres:postgres /var/lib/postgresql/$PG_VERSION/main
-        chmod 700 /var/lib/postgresql/$PG_VERSION/main
-        
-        # Try starting with pg_ctl directly
-        log "Starting PostgreSQL with pg_ctl directly..."
-        sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/pg_ctl -D /var/lib/postgresql/$PG_VERSION/main start
-        
-        # Wait a bit and check if it's running
-        sleep 5
-        if sudo -u postgres pg_isready -q; then
-            log "Successfully started PostgreSQL with pg_ctl"
-            return 0
-        else
-            log "Failed to start PostgreSQL with pg_ctl"
-        fi
-    else
-        log "PostgreSQL data directory is not properly initialized. Initializing..."
-        
-        # Initialize the data directory
-        sudo -u postgres /usr/lib/postgresql/$PG_VERSION/bin/initdb -D /var/lib/postgresql/$PG_VERSION/main
-        
-        # Try to start the cluster
-        pg_ctlcluster $PG_VERSION main start
-        
-        # Wait a bit and check if it's running
-        sleep 5
-        if sudo -u postgres pg_isready -q; then
-            log "Successfully initialized and started PostgreSQL cluster"
-            return 0
-        else
-            log "Failed to initialize and start PostgreSQL cluster"
-        fi
-    fi
-    
-    # If we get here, try recreating the cluster
-    log "Attempting to recreate PostgreSQL cluster..."
-    
-    # Stop PostgreSQL service
-    systemctl stop postgresql
-    
-    # Backup existing data if it exists
-    if [ -d "/var/lib/postgresql/$PG_VERSION/main" ]; then
-        BACKUP_DIR="/var/lib/postgresql/$PG_VERSION/main_backup_$(TZ=Asia/Singapore date +%Y%m%d%H%M%S)"
-        log "Backing up existing data directory to $BACKUP_DIR"
-        mv /var/lib/postgresql/$PG_VERSION/main $BACKUP_DIR
-    fi
-    
-    # Create new cluster
-    log "Creating new PostgreSQL cluster..."
-    pg_createcluster $PG_VERSION main
-    
-    # Start the cluster
-    pg_ctlcluster $PG_VERSION main start
-    
-    # Wait a bit and check if it's running
-    sleep 5
-    if sudo -u postgres pg_isready -q; then
-        log "Successfully recreated and started PostgreSQL cluster"
-        return 0
-    else
-        log "Failed to recreate and start PostgreSQL cluster"
-        return 1
-    fi
+    # Source the PostgreSQL functions module
+    source modules/postgresql.sh
+    
+    # Call the function from the module
+    create_demo_database "$@"
 }
 
 # Function to send email
@@ -1895,11 +954,11 @@ run_postgres_command() {
     
     # First try with peer authentication
     sudo -u postgres psql -d "$db_name" -c "$command" 2>/dev/null
-    local result=$?
-    
-    # If command successful, return
-    if [ $result -eq 0 ]; then
-        return 0
+        local result=$?
+        
+        # If command successful, return
+        if [ $result -eq 0 ]; then
+            return 0
     fi
     
     # Try running with PGPASSWORD if peer auth failed
@@ -1928,13 +987,13 @@ get_postgres_result() {
     
     # First try with peer authentication
     local result=$(sudo -u postgres psql -d "$db_name" -tAc "$query" 2>/dev/null)
-    local exit_code=$?
-    
-    # If command successful, return result
-    if [ $exit_code -eq 0 ]; then
-        echo "$result"
-        return 0
-    fi
+        local exit_code=$?
+        
+        # If command successful, return result
+        if [ $exit_code -eq 0 ]; then
+            echo "$result"
+            return 0
+        fi
     
     # Try running with PGPASSWORD if peer auth failed
     if [ -n "$PG_PASSWORD" ]; then
@@ -2306,3 +1365,4 @@ case "$1" in
 esac
 
 exit 0 
+

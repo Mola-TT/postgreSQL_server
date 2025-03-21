@@ -993,4 +993,580 @@ EOF
     
     # Return the admin password
     echo "${admin_password}"
+}
+
+# Function to save database credentials to a file
+save_database_credentials() {
+    local db_name="$1"
+    local user_name="$2"
+    local password="$3"
+
+    log "Saving database credentials to file"
+
+    # Define the credentials directory
+    local credentials_dir="/opt/dbhub/credentials"
+    local credentials_file="$credentials_dir/${db_name}_credentials.txt"
+
+    # Create credentials directory if it doesn't exist
+    mkdir -p "$credentials_dir" 2>/dev/null || {
+        log "WARNING: Could not create credentials directory at $credentials_dir"
+        log "Credentials will not be saved"
+        return 1
+    }
+
+    # Save the credentials to a file
+    cat > "$credentials_file" << EOF
+# Database Credentials for $db_name
+# SECURITY WARNING: Keep this file secure and private
+
+DATABASE_NAME=$db_name
+DATABASE_USER=$user_name
+DATABASE_PASSWORD=$password
+DATABASE_HOST=localhost
+DATABASE_PORT=5432
+
+# Connection string examples:
+# Direct PostgreSQL Connection:
+# "postgresql://$user_name:$password@localhost:5432/$db_name"
+# 
+# Via PgBouncer:
+# "postgresql://$user_name:$password@localhost:6432/$db_name"
+#
+# Command line connection example:
+# PGPASSWORD=$password psql -h localhost -p 5432 -U $user_name -d $db_name
+EOF
+
+    # Secure the credentials file
+    chmod 600 "$credentials_file" 2>/dev/null || log "WARNING: Could not set permissions on credentials file"
+
+    log "Database credentials saved to: $credentials_file"
+    return 0
+}
+
+# Function to create a demo database and user with thorough cleanup operations
+create_demo_database() {
+    local db_name="${1:-demo}"
+    local user_name="${2:-demo}"
+    local password="${3:-$(generate_password)}"
+    
+    log "Creating demo database '$db_name' and user '$user_name'"
+    
+    # Check if PostgreSQL is running
+    if ! pg_isready -q; then
+        log "ERROR: PostgreSQL is not running, cannot create demo database"
+        return 1
+    fi
+    
+    # Derived settings
+    local role_name="${user_name}_role"
+    
+    # First perform cleanup of any existing demo database/user
+    log "Checking if demo user exists and cleaning up if needed"
+    
+    # Check if user already exists
+    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null | grep -q "1"; then
+        log "Demo user already exists, performing cleanup"
+        
+        # First change ownership of the database to postgres if it exists
+        if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q "1"; then
+            log "Changing ownership of $db_name database to postgres"
+            sudo -u postgres psql -c "ALTER DATABASE $db_name OWNER TO postgres;"
+        fi
+        
+        # Revoke all privileges from the user on all databases
+        log "Revoking privileges for $user_name on all databases"
+        sudo -u postgres psql -c "REVOKE ALL PRIVILEGES ON DATABASE $db_name FROM $user_name;" || true
+        sudo -u postgres psql -c "REVOKE ALL PRIVILEGES ON DATABASE postgres FROM $user_name;" || true
+        
+        # Drop the database-specific role if it exists
+        if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$role_name'" 2>/dev/null | grep -q "1"; then
+            log "Dropping database-specific role: $role_name"
+            
+            # First handle dependencies by reassigning ownership of all objects owned by the role
+            if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q "1"; then
+                log "Checking for objects owned by $role_name in $db_name database"
+                
+                # Try with DROP OWNED BY first to reset dependency chain
+                log "Removing all objects owned by $role_name using DROP OWNED BY"
+                sudo -u postgres psql -d "$db_name" -c "DROP OWNED BY $role_name CASCADE;" || true
+                
+                # Try to drop the role immediately after dropping owned objects
+                sudo -u postgres psql -c "DROP ROLE IF EXISTS $role_name;" && {
+                    log "Successfully dropped role $role_name after dropping owned objects"
+                } || {
+                    # If drop still fails, try more aggressive approach with direct SQL
+                    log "Role still exists. Trying more aggressive approach to reassign ownership."
+                    
+                    # Reassign database ownership first if needed
+                    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name' AND datdba=(SELECT oid FROM pg_roles WHERE rolname='$role_name')" 2>/dev/null | grep -q "1"; then
+                        log "Reassigning database ownership from $role_name to postgres"
+                        sudo -u postgres psql -c "ALTER DATABASE $db_name OWNER TO postgres;"
+                    fi
+                    
+                    # Identify and fix any grants for the role that might be causing issues
+                    log "Removing grants to/from the role"
+                    sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $role_name;" || true
+                    sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $role_name;" || true
+                    sudo -u postgres psql -d "$db_name" -c "REVOKE ALL ON SCHEMA public FROM $role_name;" || true
+                    
+                    # Find dependent objects directly using detailed catalog queries
+                    log "Finding and reassigning specific dependent objects"
+                    sudo -u postgres psql -d "$db_name" << EOF
+-- Create a temporary function to identify and fix object dependencies
+DO \$\$
+DECLARE
+    obj record;
+    dependent record;
+    cmd text;
+BEGIN
+    -- List members of the role and remove them
+    FOR obj IN SELECT rolname FROM pg_roles WHERE pg_has_role(rolname, '$role_name', 'MEMBER')
+    LOOP
+        EXECUTE 'REVOKE $role_name FROM ' || quote_ident(obj.rolname);
+        RAISE NOTICE 'Revoked membership from %', obj.rolname;
+    END LOOP;
+    
+    -- Reassign default privileges
+    FOR obj IN SELECT nspname, rolname FROM pg_namespace n, pg_roles r 
+              WHERE r.rolname = '$role_name'
+    LOOP
+        BEGIN
+            EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE ' || quote_ident('$role_name') || 
+                    ' IN SCHEMA ' || quote_ident(obj.nspname) || ' GRANT ALL ON TABLES TO postgres';
+            RAISE NOTICE 'Altered default privileges in schema %', obj.nspname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error altering default privileges: %', SQLERRM;
+        END;
+    END LOOP;
+    
+    -- Find and fix any foreign key constraints where the role is referenced
+    FOR obj IN SELECT conname, conrelid::regclass::text as tabname
+              FROM pg_constraint
+              WHERE contype = 'f' 
+              AND (conrelid::regclass::text IN 
+                   (SELECT tablename FROM pg_tables WHERE tableowner = '$role_name'))
+    LOOP
+        BEGIN
+            EXECUTE 'ALTER TABLE ' || obj.tabname || ' DROP CONSTRAINT ' || quote_ident(obj.conname);
+            RAISE NOTICE 'Dropped foreign key constraint % on table %', obj.conname, obj.tabname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error dropping constraint: %', SQLERRM;
+        END;
+    END LOOP;
+    
+    -- Reassign all objects of every type using pg_depend
+    FOR obj IN SELECT DISTINCT classid::regclass::text as objtype, objid::regclass::text as objname
+              FROM pg_depend d JOIN pg_authid a ON d.refobjid = a.oid
+              WHERE a.rolname = '$role_name'
+              AND classid::regclass::text NOT LIKE 'pg_%'
+    LOOP
+        BEGIN
+            IF obj.objtype = 'pg_class' THEN
+                EXECUTE 'ALTER TABLE ' || obj.objname || ' OWNER TO postgres';
+                RAISE NOTICE 'Changed ownership of % to postgres', obj.objname;
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Error changing ownership of %: %', obj.objname, SQLERRM;
+        END;
+    END LOOP;
+END
+\$\$;
+EOF
+                    
+                    # Try one more DROP OWNED to be sure
+                    log "Performing final DROP OWNED to clear any remaining dependencies"
+                    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$role_name'" 2>/dev/null | grep -q "1"; then
+                        sudo -u postgres psql -c "DROP OWNED BY $role_name CASCADE;" || true
+                    else
+                        log "Role $role_name does not exist, skipping final DROP OWNED step"
+                    fi
+                    
+                    # Now try to drop the role again
+                    log "Attempting to drop role after dependencies have been cleared"
+                }
+            }
+            
+            # Now try to drop the role
+            sudo -u postgres psql -c "DROP ROLE IF EXISTS $role_name;"
+            
+            # If it still fails, try one final approach
+            if [ $? -ne 0 ]; then
+                log "Still unable to drop role due to dependencies. Using database-level approach..."
+                
+                # Try to force cascade drop at database level
+                sudo -u postgres psql -d "$db_name" << EOF
+DO \$\$
+BEGIN
+    -- Try to revoke all privileges granted by the role
+    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM $role_name';
+    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM $role_name';
+    EXECUTE 'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM $role_name';
+    
+    -- Try to revoke all privileges granted to the role
+    EXECUTE 'REVOKE ALL PRIVILEGES ON DATABASE $db_name FROM $role_name';
+    EXECUTE 'REVOKE ALL PRIVILEGES ON SCHEMA public FROM $role_name';
+    
+    -- Final attempt to drop any owned objects
+    EXECUTE 'DROP OWNED BY $role_name CASCADE';
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Error during final cleanup: %', SQLERRM;
+END;
+\$\$;
+EOF
+                
+                # Ultra-aggressive dependency removal approach
+                log "Using aggressive dependency removal approach..."
+                sudo -u postgres psql -d "$db_name" << EOF
+DO \$\$
+DECLARE
+    obj record;
+    dep record;
+BEGIN
+    -- Identify and fix all objects that depend on the role
+    FOR obj IN 
+        SELECT DISTINCT 
+            cl.oid as objoid,
+            cl.relname as objname, 
+            n.nspname as schema
+        FROM pg_class cl
+        JOIN pg_namespace n ON cl.relnamespace = n.oid
+        JOIN pg_depend d ON d.objid = cl.oid
+        JOIN pg_authid a ON d.refobjid = a.oid
+        WHERE a.rolname = '$role_name'
+        AND n.nspname NOT LIKE 'pg_%'
+    LOOP
+        -- For each object, change its owner to postgres
+        BEGIN
+            EXECUTE format('ALTER %s %I.%I OWNER TO postgres', 
+                          CASE 
+                            WHEN EXISTS (SELECT 1 FROM pg_tables WHERE schemaname=obj.schema AND tablename=obj.objname) THEN 'TABLE'
+                            WHEN EXISTS (SELECT 1 FROM pg_views WHERE schemaname=obj.schema AND viewname=obj.objname) THEN 'VIEW'
+                            WHEN EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace=n.oid 
+                                        WHERE n.nspname=obj.schema AND t.typname=obj.objname) THEN 'TYPE'
+                            ELSE 'TABLE'
+                          END,
+                          obj.schema, obj.objname);
+            RAISE NOTICE 'Changed owner of %.% to postgres', obj.schema, obj.objname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not change owner of %.%: %', obj.schema, obj.objname, SQLERRM;
+        END;
+    END LOOP;
+    
+    -- Try to clean up functions owned by the role
+    FOR obj IN 
+        SELECT p.oid, p.proname, n.nspname as schema
+        FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE p.proowner = (SELECT oid FROM pg_authid WHERE rolname = '$role_name')
+        AND n.nspname NOT LIKE 'pg_%'
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER FUNCTION %I.%I() OWNER TO postgres', obj.schema, obj.proname);
+            RAISE NOTICE 'Changed owner of function %.% to postgres', obj.schema, obj.proname;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not change owner of function %.%: %', obj.schema, obj.proname, SQLERRM;
+        END;
+    END LOOP;
+    
+    -- Try to clean up acess privileges referencing this role
+    EXECUTE 'UPDATE pg_class SET relacl = NULL WHERE relacl::text LIKE ''%' || '$role_name' || '%''';
+    EXECUTE 'UPDATE pg_proc SET proacl = NULL WHERE proacl::text LIKE ''%' || '$role_name' || '%''';
+    EXECUTE 'UPDATE pg_namespace SET nspacl = NULL WHERE nspacl::text LIKE ''%' || '$role_name' || '%''';
+    EXECUTE 'UPDATE pg_type SET typacl = NULL WHERE typacl::text LIKE ''%' || '$role_name' || '%''';
+    
+    -- Final DROP OWNED attempt
+    BEGIN
+        EXECUTE 'DROP OWNED BY $role_name CASCADE';
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Final DROP OWNED failed: %', SQLERRM;
+    END;
+END \$\$;
+EOF
+
+                # Direct PostgreSQL operation on the database after the here-document
+                sudo -u postgres psql -d "$db_name" -c "DROP OWNED BY $role_name CASCADE;" || true
+
+                # Try dropping the role one final time
+                sudo -u postgres psql -c "DROP ROLE IF EXISTS $role_name;"
+
+                # If it still fails, warn but continue with script
+                if [ $? -ne 0 ]; then
+                    log "WARNING: Unable to drop role $role_name despite multiple attempts. This may leave orphaned objects."
+                    log "WARNING: Proceeding with the rest of the script. Manual cleanup may be needed later."
+                else
+                    log "Successfully dropped role $role_name after extensive cleanup"
+                fi
+            fi
+        fi
+    fi
+    
+    # Check if role owns any objects in the demo database and reassign them to postgres
+    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q "1"; then
+        log "Reassigning owned objects in $db_name database to postgres"
+        sudo -u postgres psql -c "REASSIGN OWNED BY $user_name TO postgres;" || true
+        sudo -u postgres psql -d "$db_name" -c "REASSIGN OWNED BY $user_name TO postgres;" || true
+        
+        log "Performing additional object cleanup in $db_name database"
+        
+        # Find remaining objects owned by the user in the demo database
+        local objects_sql="SELECT nspname, relname, relkind FROM pg_class c
+                         JOIN pg_namespace n ON c.relnamespace = n.oid
+                         WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
+                         ORDER BY relkind, nspname, relname;"
+        
+        # Try to drop these objects - using -t (tuples only) and -A (unaligned) for clean output
+        sudo -u postgres psql -d "$db_name" -t -A -F' ' -c "$objects_sql" | while read schema table kind; do
+            [ -z "$schema" ] && continue
+            
+            if [ "$kind" = "r" ]; then # regular table
+                log "Dropping table $schema.$table owned by $user_name"
+                sudo -u postgres psql -d "$db_name" -c "DROP TABLE IF EXISTS $schema.$table CASCADE;"
+            elif [ "$kind" = "v" ]; then # view
+                log "Dropping view $schema.$table owned by $user_name"
+                sudo -u postgres psql -d "$db_name" -c "DROP VIEW IF EXISTS $schema.$table CASCADE;"
+            elif [ "$kind" = "S" ]; then # sequence
+                log "Dropping sequence $schema.$table owned by $user_name"
+                sudo -u postgres psql -d "$db_name" -c "DROP SEQUENCE IF EXISTS $schema.$table CASCADE;"
+            elif [ "$kind" = "i" ]; then # index
+                log "Dropping index $schema.$table owned by $user_name"
+                sudo -u postgres psql -d "$db_name" -c "DROP INDEX IF EXISTS $schema.$table CASCADE;"
+            fi
+        done
+        
+        # Check for functions owned by the user
+        local functions_sql="SELECT nspname, proname FROM pg_proc p
+                          JOIN pg_namespace n ON p.pronamespace = n.oid
+                          WHERE proowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name')
+                          ORDER BY nspname, proname;"
+        
+        # Try to drop these functions - using -t (tuples only) and -A (unaligned) for clean output
+        sudo -u postgres psql -d "$db_name" -t -A -F' ' -c "$functions_sql" | while read schema func; do
+            [ -z "$schema" ] && continue
+            
+            log "Dropping function $schema.$func owned by $user_name"
+            sudo -u postgres psql -d "$db_name" -c "DROP FUNCTION IF EXISTS $schema.$func CASCADE;"
+        done
+    fi
+    
+    # Drop owned by user in postgres database
+    log "Dropping owned objects for $user_name in postgres database"
+    # Check if role exists before trying to drop owned objects
+    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null | grep -q "1"; then
+        sudo -u postgres psql -c "DROP OWNED BY $user_name CASCADE;" || true
+    else
+        log "Role $user_name does not exist, skipping DROP OWNED step"
+    fi
+    
+    # Try to drop the user directly
+    log "Attempting to drop user $user_name"
+    sudo -u postgres psql -c "DROP ROLE IF EXISTS $user_name;" && {
+        log "User $user_name dropped successfully"
+    } || {
+        # Find and drop remaining dependencies in all databases
+        log "Scanning all databases for remaining dependencies"
+        sudo -u postgres psql -tAc "SELECT datname FROM pg_database WHERE datname NOT IN ('template0', 'template1') AND datistemplate = false;" | while read db; do
+            log "Checking database: $db"
+            
+            # If this is the demo database, try drastic measures - drop schemas owned by the user
+            if [ "$db" = "$db_name" ]; then
+                log "Taking drastic measures in demo database"
+                
+                # Try to drop schemas
+                local schemas=$(sudo -u postgres psql -d "$db" -tAc "SELECT nspname FROM pg_namespace WHERE nspowner = (SELECT oid FROM pg_roles WHERE rolname = '$user_name');")
+                
+                for schema in $schemas; do
+                    log "Dropping schema $schema owned by $user_name"
+                    sudo -u postgres psql -d "$db" -c "DROP SCHEMA IF EXISTS $schema CASCADE;"
+                done
+                
+                # Try again to drop role
+                sudo -u postgres psql -c "DROP ROLE IF EXISTS $user_name;" && {
+                    log "User $user_name dropped successfully after schema cleanup"
+                    break
+                }
+            fi
+            
+            # Try to reassign ownership and drop owned as a last resort
+            if sudo -u postgres psql -d "$db" -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null | grep -q "1"; then
+                sudo -u postgres psql -d "$db" -c "REASSIGN OWNED BY $user_name TO postgres; DROP OWNED BY $user_name CASCADE;" || true
+            else
+                log "Role $user_name does not exist in database $db, skipping reassign/drop owned steps"
+            fi
+        done
+        
+        # Try once more to drop the role
+        sudo -u postgres psql -c "DROP ROLE IF EXISTS $user_name;" || {
+            log "ERROR: Still could not drop user. Will continue with creating a new database."
+            # Force drop and recreate the database as last resort
+            log "Force dropping and recreating the demo database as last resort"
+            
+            # Generate a backup name for the database if we need to rename it
+            local timestamp=$(date +%Y%m%d%H%M%S)
+            local new_db_name="${db_name}_old_$timestamp"
+            
+            # Force drop database - without WITH (FORCE) which might not be supported in all versions
+            # First terminate all connections
+            log "Attempting to drop database forcefully"
+            sudo -u postgres psql -c "UPDATE pg_database SET datallowconn = 'false' WHERE datname = '$db_name';" || true
+            
+            # Terminate existing connections
+            sudo -u postgres psql -c "
+                SELECT pg_terminate_backend(pg_stat_activity.pid)
+                FROM pg_stat_activity
+                WHERE pg_stat_activity.datname = '$db_name'
+                AND pid <> pg_backend_pid();" || true
+            
+            # Wait a moment for connections to be terminated
+            sleep 2
+            
+            # Now try to drop the database (should be no connections)
+            sudo -u postgres psql -c "DROP DATABASE $db_name;" || {
+                log "WARNING: Could not drop database, trying to force connection termination again"
+                
+                # Wait longer and try again with more force
+                sleep 5
+                sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name';" || true
+                sudo -u postgres psql -c "DROP DATABASE $db_name;" || {
+                    # Final desperate measure - rename the database
+                    log "WARNING: Could not drop the database, renaming it instead"
+                    
+                    sudo -u postgres psql -c "ALTER DATABASE $db_name RENAME TO $new_db_name;" || true
+                }
+            }
+        }
+    }
+    
+    # Create demo database (make sure it's owned by postgres initially)
+    log "Creating demo database"
+    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q "1"; then
+        sudo -u postgres psql -c "CREATE DATABASE $db_name OWNER postgres;"
+        log "Demo database created"
+    else
+        log "Demo database already exists, ensuring correct ownership"
+        sudo -u postgres psql -c "ALTER DATABASE $db_name OWNER TO postgres;"
+    fi
+    
+    # Create the demo user
+    log "Creating demo user"
+    sudo -u postgres psql -c "CREATE ROLE $user_name WITH LOGIN PASSWORD '$password';"
+    
+    # Create a database-specific role for stricter isolation
+    log "Creating database-specific role"
+    sudo -u postgres psql -c "CREATE ROLE $role_name;"
+    
+    # Start implementing multi-layered isolation measures
+    
+    # 1. Set up proper privileges and schema security
+    log "Setting up schema security and privileges"
+    
+    # Connect to the demo database and set up its schema security
+    sudo -u postgres psql -d "$db_name" -c "
+        -- Revoke public schema usage from PUBLIC and grant it only to specific users
+        REVOKE ALL ON SCHEMA public FROM PUBLIC;
+        GRANT ALL ON SCHEMA public TO postgres;
+        GRANT ALL ON SCHEMA public TO $role_name;
+        GRANT USAGE ON SCHEMA public TO $user_name;
+        
+        -- Grant privileges on all existing tables
+        GRANT ALL ON ALL TABLES IN SCHEMA public TO $role_name;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO $user_name;
+        
+        -- Grant privileges on all future tables
+        ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+            GRANT ALL ON TABLES TO $role_name;
+        ALTER DEFAULT PRIVILEGES FOR ROLE $role_name IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO $user_name;
+            
+        -- Grant privileges on all sequences
+        GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $role_name;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO $user_name;
+        
+        -- Grant privileges on all future sequences
+        ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+            GRANT ALL ON SEQUENCES TO $role_name;
+        ALTER DEFAULT PRIVILEGES FOR ROLE $role_name IN SCHEMA public
+            GRANT USAGE, SELECT ON SEQUENCES TO $user_name;
+    "
+    
+    # 2. Explicitly revoke connect permission to postgres database
+    sudo -u postgres psql -c "REVOKE ALL ON DATABASE postgres FROM PUBLIC;"
+    sudo -u postgres psql -c "REVOKE ALL ON DATABASE postgres FROM $user_name;"
+    sudo -u postgres psql -c "REVOKE CONNECT ON DATABASE postgres FROM $user_name;"
+    
+    # 3. Grant specific privileges only to the demo database
+    log "Setting up proper schema permissions in the demo database"
+    sudo -u postgres psql -c "
+        -- Grant connect to the demo database
+        GRANT CONNECT ON DATABASE $db_name TO $user_name;
+        
+        -- Set the user's search_path to be restricted
+        ALTER ROLE $user_name SET search_path TO $db_name, public;
+    "
+    
+    # 4a. Block visibility of other databases through catalog views
+    log "Restricting visibility of other databases"
+    
+    # Revoke access to system catalog views that expose database information
+    sudo -u postgres psql -c "REVOKE SELECT ON pg_catalog.pg_database FROM $user_name;"
+    
+    # 4b. Create a database-specific view of pg_database that only shows the demo database
+    
+    # Create a database-specific role to strictly limit visibility
+    log "Creating database-specific role for strict isolation"
+    sudo -u postgres psql -c "
+        -- Grant membership in the role to the user
+        GRANT $role_name TO $user_name;
+        
+        -- Transfer ownership of the database to the role
+        ALTER DATABASE $db_name OWNER TO ${user_name}_role;
+    "
+    
+    # Create a function that fakes the pg_database view
+    sudo -u postgres psql -d "$db_name" -c "CREATE OR REPLACE FUNCTION public.database_list() RETURNS SETOF pg_catalog.pg_database AS \$\$
+        SELECT * FROM pg_catalog.pg_database WHERE datname = '$db_name';
+    \$\$ LANGUAGE sql SECURITY DEFINER;"
+    
+    # Create a restricted view that only shows the demo database
+    sudo -u postgres psql -d "$db_name" -c "CREATE OR REPLACE VIEW pg_database_filtered AS
+        SELECT * FROM pg_catalog.pg_database WHERE datname = '$db_name';"
+    
+    # Grant permissions on the function and view
+    sudo -u postgres psql -d "$db_name" -c "
+        -- Grant select on the filtered view
+        GRANT SELECT ON pg_database_filtered TO $user_name;
+    "
+    
+    # Set ownership of the function to postgres (to prevent the user from modifying it)
+    sudo -u postgres psql -d "$db_name" -c "ALTER FUNCTION public.database_list() OWNER TO postgres;"
+    
+    # Grant execute to the user
+    sudo -u postgres psql -d "$db_name" -c "GRANT EXECUTE ON FUNCTION public.database_list() TO $user_name;"
+    
+    # 5. Apply hostname validation for the demo database subdomain
+    if [ -z "$DOMAIN_SUFFIX" ]; then
+        DOMAIN_SUFFIX="dbhub.cc"
+    fi
+
+    # Update hostname mapping for subdomain access
+    update_hostname_map_conf "$db_name" "$db_name" "$DOMAIN_SUFFIX"
+    
+    # Configure database-specific connection restrictions
+    configure_db_connection_restrictions "$db_name" "$db_name" "$DOMAIN_SUFFIX"
+    
+    # Reload PostgreSQL to apply changes
+    pg_ctlcluster $PG_VERSION main reload || systemctl reload postgresql || true
+    
+    log "Demo database and user created with strict isolation"
+    log "Demo user can ONLY access the $db_name database"
+    log "The database is ONLY accessible through subdomain $db_name.$DOMAIN_SUFFIX"
+    
+    # Test the subdomain access restrictions
+    test_subdomain_access "$db_name" "$db_name" "$DOMAIN_SUFFIX"
+
+    # Store user info and credentials
+    save_database_credentials "$db_name" "$user_name" "$password"
+
+    # Return the user details for display in the summary
+    echo "$db_name,$user_name,$password"
+    return 0
 } 
