@@ -383,7 +383,7 @@ EOF
 }
 
 # Test subdomain access control
-    test_subdomain_access "" "" ""
+test_subdomain_access() {
     local db_name="$1"
     local subdomain="$2"
     local domain="${3:-dbhub.cc}"
