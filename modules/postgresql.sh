@@ -1560,9 +1560,9 @@ EOF
     log "Demo user can ONLY access the $db_name database"
     log "The database is ONLY accessible through subdomain $db_name.$DOMAIN_SUFFIX"
     
-# Test the subdomain access restrictions
-test_subdomain_access "$db_name" "$db_name" "$DOMAIN_SUFFIX"
 
+    # Test the subdomain access restrictions
+    test_subdomain_access "$db_name" "$db_name" "$DOMAIN_SUFFIX"
     # Store user info and credentials
     save_database_credentials "$db_name" "$user_name" "$password"
 
