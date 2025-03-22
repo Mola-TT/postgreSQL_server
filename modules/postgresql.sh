@@ -932,7 +932,7 @@ EOF
 }
 
 # Function to create a demo database and user with thorough cleanup operations
-create_demo_database() {
+_module_create_demo_database() {
     local db_name="${1:-demo}"
     local user_name="${2:-demo}"
     local password="${3:-$(generate_password)}"

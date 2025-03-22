@@ -796,11 +796,95 @@ EOF
 
 # Function to create a demo database and user
 create_demo_database() {
-    # Source the PostgreSQL functions module
-    source modules/postgresql.sh
+    # Define path to look for module first in current dir, then in absolute paths
+    local module_path=""
     
-    # Call the function from the module
-    create_demo_database "$@"
+    # Try to find the modules directory relative to the current script
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    # Check different possible module locations
+    if [ -f "$script_dir/modules/postgresql.sh" ]; then
+        module_path="$script_dir/modules/postgresql.sh"
+    elif [ -f "$(pwd)/modules/postgresql.sh" ]; then
+        module_path="$(pwd)/modules/postgresql.sh"
+    elif [ -f "/opt/dbhub/modules/postgresql.sh" ]; then
+        module_path="/opt/dbhub/modules/postgresql.sh"
+    elif [ -f "/usr/local/dbhub/modules/postgresql.sh" ]; then
+        module_path="/usr/local/dbhub/modules/postgresql.sh"
+    fi
+    
+    # If we found the module, source it
+    if [ -n "$module_path" ]; then
+        log "Sourcing PostgreSQL module from: $module_path"
+        source "$module_path"
+        # Call the function from the module
+        _module_create_demo_database "$@"
+    else
+        # If module not found, implement a basic version directly here
+        log "Module not found, using built-in implementation"
+        _create_demo_database_builtin "$@"
+    fi
+}
+
+# Built-in implementation for when the module isn't available
+_create_demo_database_builtin() {
+    local db_name="${1:-demo}"
+    local user_name="${2:-demo}"
+    local password="${3:-demo}"
+    
+    log "Creating demo database '$db_name' and user '$user_name' using built-in implementation"
+    
+    # Check if PostgreSQL is running
+    if ! pg_isready -q; then
+        log "ERROR: PostgreSQL is not running, cannot create demo database"
+        return 1
+    fi
+    
+    # Create database if it doesn't exist
+    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | grep -q "1"; then
+        log "Creating database $db_name"
+        sudo -u postgres psql -c "CREATE DATABASE $db_name;"
+        log "Database $db_name created"
+    else
+        log "Database $db_name already exists"
+    fi
+    
+    # Create user if it doesn't exist
+    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$user_name'" 2>/dev/null | grep -q "1"; then
+        log "Creating user $user_name"
+        sudo -u postgres psql -c "CREATE USER $user_name WITH PASSWORD '$password';"
+        log "User $user_name created"
+    else
+        log "User $user_name already exists, updating password"
+        sudo -u postgres psql -c "ALTER USER $user_name WITH PASSWORD '$password';"
+    fi
+    
+    # Grant privileges
+    log "Granting privileges to $user_name on database $db_name"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO $user_name;"
+    
+    # Connect to the database and set up schema privileges
+    log "Setting up schema privileges in $db_name"
+    sudo -u postgres psql -d "$db_name" -c "
+        -- Grant privileges on public schema
+        GRANT ALL ON SCHEMA public TO $user_name;
+        
+        -- Grant privileges on existing tables
+        GRANT ALL ON ALL TABLES IN SCHEMA public TO $user_name;
+        
+        -- Grant privileges on future tables
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO $user_name;
+        
+        -- Grant privileges on sequences
+        GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $user_name;
+        
+        -- Grant privileges on future sequences
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO $user_name;
+    "
+    
+    log "Demo database and user created successfully using built-in implementation"
+    echo "$db_name,$user_name,$password"
+    return 0
 }
 
 # Function to send email
