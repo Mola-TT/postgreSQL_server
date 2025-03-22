@@ -811,14 +811,29 @@ create_demo_database() {
         module_path="/opt/dbhub/modules/postgresql.sh"
     elif [ -f "/usr/local/dbhub/modules/postgresql.sh" ]; then
         module_path="/usr/local/dbhub/modules/postgresql.sh"
+    elif [ -f "/root/postgreSQL_server/modules/postgresql.sh" ]; then
+        module_path="/root/postgreSQL_server/modules/postgresql.sh"
     fi
     
-    # If we found the module, source it
+    # If we found the module, source it with error checking
     if [ -n "$module_path" ]; then
         log "Sourcing PostgreSQL module from: $module_path"
-        source "$module_path"
-        # Call the function from the module
-        _module_create_demo_database "$@"
+        
+        # Source the module with error checking
+        if ! source "$module_path" 2>/dev/null; then
+            log "WARNING: Error sourcing module from $module_path. Using built-in implementation."
+            _create_demo_database_builtin "$@"
+            return $?
+        fi
+            
+        # Check if the function exists in the sourced module
+        if type _module_create_demo_database >/dev/null 2>&1; then
+            # Call the function from the module
+            _module_create_demo_database "$@"
+        else
+            log "WARNING: Function _module_create_demo_database not found in module. Using built-in implementation."
+            _create_demo_database_builtin "$@"
+        fi
     else
         # If module not found, implement a basic version directly here
         log "Module not found, using built-in implementation"
@@ -1006,6 +1021,169 @@ Setup completed at: $(TZ=Asia/Singapore date +'%Y-%m-%d %H:%M:%S')
     
     # Send email
     send_email "PostgreSQL Server Setup Complete" "$message"
+}
+
+# Function to setup monitoring
+setup_monitoring() {
+    log "Setting up monitoring"
+    
+    # Define path to look for module first in current dir, then in absolute paths
+    local module_path=""
+    
+    # Try to find the modules directory relative to the current script
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    # Check different possible module locations
+    if [ -f "$script_dir/modules/monitoring.sh" ]; then
+        module_path="$script_dir/modules/monitoring.sh"
+    elif [ -f "$(pwd)/modules/monitoring.sh" ]; then
+        module_path="$(pwd)/modules/monitoring.sh"
+    elif [ -f "/opt/dbhub/modules/monitoring.sh" ]; then
+        module_path="/opt/dbhub/modules/monitoring.sh"
+    elif [ -f "/usr/local/dbhub/modules/monitoring.sh" ]; then
+        module_path="/usr/local/dbhub/modules/monitoring.sh"
+    elif [ -f "/root/postgreSQL_server/modules/monitoring.sh" ]; then
+        module_path="/root/postgreSQL_server/modules/monitoring.sh"
+    fi
+    
+    # If we found the module, source it with error checking
+    if [ -n "$module_path" ]; then
+        log "Sourcing monitoring module from: $module_path"
+        
+        # Source the module with error checking
+        if ! source "$module_path" 2>/dev/null; then
+            log "WARNING: Error sourcing monitoring module. Skipping monitoring setup."
+            return 1
+        fi
+            
+        # Call the original function
+        # We can't check for the function name as there's a circular reference
+        # The module defines setup_monitoring and we're also defining it here
+        # So we use a different approach by defining a unique function name
+        if declare -f _module_setup_monitoring > /dev/null; then
+            # Function exists, call it
+            _module_setup_monitoring "$@"
+        else
+            log "WARNING: Function _module_setup_monitoring not found in module. Skipping monitoring setup."
+            _setup_monitoring_fallback
+        fi
+    else
+        # If module not found, log warning
+        log "Monitoring module not found, using fallback implementation"
+        _setup_monitoring_fallback
+    fi
+}
+
+# Fallback implementation for when the monitoring module isn't available
+_setup_monitoring_fallback() {
+    log "Setting up basic monitoring with fallback implementation"
+    
+    # Create monitoring scripts directory
+    local monitoring_dir="/opt/dbhub/monitoring"
+    mkdir -p "$monitoring_dir"
+    
+    # Create basic monitoring script
+    cat > "$monitoring_dir/basic_monitor.sh" << 'EOF'
+#!/bin/bash
+
+# Basic PostgreSQL monitoring script
+# This is a fallback script that provides minimal monitoring capabilities
+
+# Log file
+LOG_FILE="/var/log/dbhub/monitoring.log"
+
+# Ensure log directory exists
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+
+# Log function
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# Check PostgreSQL status
+check_postgresql() {
+    if pg_isready -q; then
+        log "PostgreSQL is running normally"
+        return 0
+    else
+        log "WARNING: PostgreSQL is not running properly"
+        return 1
+    fi
+}
+
+# Check disk space
+check_disk_space() {
+    local disk_usage=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+    
+    if [ "$disk_usage" -gt 90 ]; then
+        log "ALERT: Disk usage is at ${disk_usage}% (critical)"
+        return 2
+    elif [ "$disk_usage" -gt 80 ]; then
+        log "WARNING: Disk usage is at ${disk_usage}% (warning)"
+        return 1
+    else
+        log "Disk usage is at ${disk_usage}% (normal)"
+        return 0
+    fi
+}
+
+# Main monitoring function
+main() {
+    log "Starting basic monitoring check"
+    
+    # Check PostgreSQL
+    check_postgresql
+    
+    # Check disk space
+    check_disk_space
+    
+    log "Monitoring check completed"
+}
+
+# Run main function
+main
+EOF
+    
+    # Make script executable
+    chmod +x "$monitoring_dir/basic_monitor.sh"
+    
+    # Create systemd timer for regular monitoring
+    cat > "/etc/systemd/system/basic-monitor.service" << EOF
+[Unit]
+Description=Basic PostgreSQL Monitoring Service
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=$monitoring_dir/basic_monitor.sh
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    cat > "/etc/systemd/system/basic-monitor.timer" << EOF
+[Unit]
+Description=Run Basic PostgreSQL Monitoring every 15 minutes
+Requires=basic-monitor.service
+
+[Timer]
+Unit=basic-monitor.service
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+    
+    # Enable and start the timer
+    systemctl daemon-reload
+    systemctl enable basic-monitor.timer
+    systemctl start basic-monitor.timer
+    
+    log "Basic monitoring configured and started"
 }
 
 # Function to make all modules and scripts executable

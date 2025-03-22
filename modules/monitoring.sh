@@ -1,9 +1,9 @@
-#!/bin/bash
+# Monitoring Module
 
 # Monitoring-related functions for PostgreSQL server setup
 
-# Function to set up monitoring
-setup_monitoring() {
+# Main monitoring setup function
+_module_setup_monitoring() {
     log "Setting up monitoring"
     
     # Copy monitoring scripts

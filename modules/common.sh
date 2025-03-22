@@ -1,6 +1,4 @@
-#!/bin/bash
-
-# Common Utility Module
+# Common functions module
 # Contains shared utility functions for the DBHub.cc scripts
 
 # Set default values

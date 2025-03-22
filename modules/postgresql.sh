@@ -1,5 +1,4 @@
-﻿#!/bin/bash
-# PostgreSQL Module
+﻿# PostgreSQL Module
 # Contains functions for managing PostgreSQL databases and security configurations
 
 # Get PostgreSQL version

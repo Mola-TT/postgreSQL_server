@@ -1,4 +1,4 @@
-#!/bin/bash
+# Security Module
 
 # Security-related functions for PostgreSQL server setup
 

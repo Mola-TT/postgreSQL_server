@@ -1,4 +1,4 @@
-#!/bin/bash
+# PgBouncer Module
 
 # PgBouncer installation and configuration functions
 
